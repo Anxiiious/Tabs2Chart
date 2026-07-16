@@ -1,0 +1,23 @@
+[project]
+name = "shred2chart"
+version = "0.1.0"
+description = "Convert Sheet Happens Guitar Pro tabs into Clone Hero charts"
+requires-python = ">=3.10"
+dependencies = [
+    "PyGuitarPro>=0.11",
+]
+
+[project.scripts]
+shred2chart = "shred2chart.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["shred2chart"]
