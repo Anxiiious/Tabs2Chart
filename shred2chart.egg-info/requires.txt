@@ -1,0 +1,5 @@
+PyGuitarPro>=0.10
+
+[dev]
+pytest>=7.0
+pytest-cov

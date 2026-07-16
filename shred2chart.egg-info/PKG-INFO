@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: shred2chart
+Version: 0.1.0
+Summary: Convert Guitar Pro tabs (.gp5/.gpx) into playable Clone Hero charts
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: PyGuitarPro>=0.10
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+
+# Tabs2Chart
