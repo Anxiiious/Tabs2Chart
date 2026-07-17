@@ -103,7 +103,12 @@ def test_dump_ir_single_notes_and_chord_and_techniques():
     assert first["string"] == 3  # GPIF's 0-based 2 -> our 1-based 3
     assert first["chord_id"] is None
     assert first["tied"] is True
-    assert first["hopo"] is True
+    # No previous note to compare against, so a destination note with no
+    # prior context defaults to hammer-on (matches ir_gp.py's convention
+    # of "no previous note means no inherited HOPO" landing on the same
+    # not-a-pull-off side).
+    assert first["hammer_on"] is True
+    assert first["pull_off"] is False
     assert first["tap"] is True
 
     # Beat 1 was a rest (still advances the clock by one quarter note),
@@ -111,7 +116,8 @@ def test_dump_ir_single_notes_and_chord_and_techniques():
     chord_a, chord_b = result[1], result[2]
     assert chord_a["tick"] == chord_b["tick"] == 2 * TICKS_PER_QUARTER
     assert chord_a["chord_id"] == chord_b["chord_id"] is not None
-    assert chord_b["slide"] is True
+    assert chord_b["slide_out"] is True  # Flags=2 is a legato slide-out
+    assert chord_b["slide_in"] is False
     assert chord_b["slide_flags"] == 2
     assert chord_b["palm_mute"] is True
 

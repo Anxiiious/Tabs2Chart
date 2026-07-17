@@ -26,13 +26,25 @@ scope. `<MasterBar><Bars>` lists one bar-id per track, in the same order
 as `<MasterTrack><Tracks>`.
 
 Confidence notes (see SHRED2CHART_GAMEPLAN.md for the fuller picture):
-- hopo/palm_mute/dead_note/bend/tap/vibrato/let_ring/tied: each confirmed
+- palm_mute/dead_note/bend/tap/vibrato/let_ring/tied: each confirmed
   present in at least one real file.
-- slide: confirmed the <Slide><Flags> property exists, but NOT what each
-  flag value means directionally (only one example, Flags=2, seen so
-  far) — exposed as a raw `slide_flags` int rather than guessed
-  slide_in/slide_out booleans (contrast with ir_gp.py, where PyGuitarPro
-  gives us a real enum for this).
+- hammer_on/pull_off: HopoOrigin/HopoDestination tell us THAT a note is
+  a hammer-on/pull-off, but not which direction. Direction is inferred
+  by comparing fret numbers against the previous note in the track's
+  linear sequence (lower fret = pull-off, else hammer-on) — the exact
+  approach used by editor-on-fire's GP5 importer
+  (github.com/raynebc/editor-on-fire src/gp_import.c), read as a
+  second-opinion cross-check on this logic. Like that reference, this
+  tracks "the previous note" per track rather than per string, which is
+  an approximation that only really holds up for monophonic lines.
+- slide: the <Slide><Flags> bitmask is now decoded into slide_in/
+  slide_out (raw `slide_flags` kept too). The bit assignments (1=shift,
+  2=legato, 4=slide out down, 8=slide out up, 16=slide in from below,
+  32=slide in from above) come from the same editor-on-fire source,
+  which documents this exact bitmask for GP5+ files; GP7's GPIF Slide
+  property appears to reuse it unchanged (our one real example,
+  Flags=2, decodes as a legato slide-out, which matched what the note
+  looked like in context).
 - tremolo_picked: a <Tremolo> element on the *beat*, not the note; we
   copy it onto every note in that beat since the IR is note-centric.
 """
@@ -47,6 +59,11 @@ _NOTE_VALUE_DENOMINATOR = {
     "Whole": 1, "Half": 2, "Quarter": 4, "Eighth": 8,
     "16th": 16, "32nd": 32, "64th": 64, "128th": 128,
 }
+
+# GP5+ binary Slide bitmask (confirmed via editor-on-fire's GP importer;
+# see module docstring). GPIF's <Slide><Flags> appears to reuse it.
+_SLIDE_OUT_MASK = 1 | 2 | 4 | 8  # shift, legato, out-downwards, out-upwards
+_SLIDE_IN_MASK = 16 | 32  # in-from-below, in-from-above
 
 
 def _rhythm_ticks(rhythm_el: ET.Element) -> int:
@@ -72,7 +89,10 @@ def _rhythm_ticks(rhythm_el: ET.Element) -> int:
     return ticks
 
 
-def _note_to_ir(note_el: ET.Element, tick: int, duration_ticks: int, chord_id: int | None, tremolo_picked: bool) -> dict[str, Any]:
+def _note_to_ir(
+    note_el: ET.Element, tick: int, duration_ticks: int, chord_id: int | None, tremolo_picked: bool,
+    previous_fret: int | None,
+) -> dict[str, Any]:
     props = {p.get("name"): p for p in note_el.findall("./Properties/Property")}
 
     def prop_int(name: str, child_tag: str) -> int | None:
@@ -86,6 +106,7 @@ def _note_to_ir(note_el: ET.Element, tick: int, duration_ticks: int, chord_id: i
     pitch = prop_int("Midi", "Number")
     string = prop_int("String", "String")
     slide_flags = prop_int("Slide", "Flags") or 0
+    is_hopo = "HopoDestination" in props
 
     return {
         "tick": tick,
@@ -94,8 +115,10 @@ def _note_to_ir(note_el: ET.Element, tick: int, duration_ticks: int, chord_id: i
         "string": string + 1 if string is not None else None,  # GPIF strings are 0-based
         "fret": fret,
         "chord_id": chord_id,
-        "hopo": "HopoOrigin" in props or "HopoDestination" in props,
-        "slide": slide_flags != 0,
+        "hammer_on": is_hopo and (previous_fret is None or fret is None or fret >= previous_fret),
+        "pull_off": is_hopo and previous_fret is not None and fret is not None and fret < previous_fret,
+        "slide_in": bool(slide_flags & _SLIDE_IN_MASK),
+        "slide_out": bool(slide_flags & _SLIDE_OUT_MASK),
         "slide_flags": slide_flags,
         "palm_mute": "PalmMuted" in props,
         "dead_note": "Muted" in props,
@@ -146,6 +169,7 @@ def dump_ir(xml_text: str, track_index: int = 0) -> list[dict[str, Any]]:
     master_bars = root.findall("./MasterBars/MasterBar")
     notes_ir: list[dict[str, Any]] = []
     chord_counter = 0
+    previous_fret: int | None = None
 
     for bar_index, master_bar in enumerate(master_bars):
         bars_ref_el = master_bar.find("Bars")
@@ -180,9 +204,11 @@ def dump_ir(xml_text: str, track_index: int = 0) -> list[dict[str, Any]]:
                     chord_counter += 1
                 tremolo_picked = beat_el.find("Tremolo") is not None
                 for note_id in note_ids:
-                    notes_ir.append(
-                        _note_to_ir(notes_by_id[note_id], tick, duration_ticks, chord_id, tremolo_picked)
-                    )
+                    note_el = notes_by_id[note_id]
+                    ir_note = _note_to_ir(note_el, tick, duration_ticks, chord_id, tremolo_picked, previous_fret)
+                    notes_ir.append(ir_note)
+                    if ir_note["fret"] is not None:
+                        previous_fret = ir_note["fret"]
 
             tick += duration_ticks
 

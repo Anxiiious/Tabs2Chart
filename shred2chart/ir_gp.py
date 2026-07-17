@@ -9,11 +9,20 @@ Only the primary voice (voice 0) of a single track is read — multi-voice
 measures and the bass/drum tracks are out of scope for v1 per the game
 plan's non-goals.
 
-Note on `hopo`: PyGuitarPro's NoteEffect.hammer is a single boolean with
-no hammer-on vs. pull-off distinction — that direction is normally
-inferred by comparing pitch with the previous note (higher = hammer-on,
-lower = pull-off). That inference is deferred to Stage 4 (note mapping),
-since for M1 the goal is just getting the raw data out correctly.
+hammer_on/pull_off: PyGuitarPro's NoteEffect.hammer is a single boolean
+per GP3/4/5's binary format (confirmed against editor-on-fire's own GP
+importer, github.com/raynebc/editor-on-fire src/gp_import.c) — and
+critically, that flag is set on the ORIGIN note ("this note leads into a
+hammer-on/pull-off with the next note"), not the destination note that
+actually gets played without picking. An earlier version of this module
+exposed the flag as-is, which meant it was attached to the wrong note
+entirely. Fixed by shifting it forward: note N is hammer_on/pull_off iff
+note N-1 had the flag set, with direction from comparing fret numbers
+(EOF's exact logic: destination fret < origin fret => pull-off, else
+hammer-on). Chords make "the previous note" ambiguous (which string?);
+we track it per the track's linear note sequence regardless of string,
+same simplification EOF itself uses — fine for monophonic lead lines,
+unreliable right at a chord boundary.
 """
 from __future__ import annotations
 
@@ -31,7 +40,10 @@ _SLIDE_OUT_TYPES = {
 }
 
 
-def _note_to_ir(note: guitarpro.Note, tick: int, duration_ticks: int, chord_id: int | None) -> dict[str, Any]:
+def _note_to_ir(
+    note: guitarpro.Note, tick: int, duration_ticks: int, chord_id: int | None,
+    is_hopo: bool, previous_fret: int | None,
+) -> dict[str, Any]:
     effect = note.effect
     return {
         "tick": tick,
@@ -40,7 +52,8 @@ def _note_to_ir(note: guitarpro.Note, tick: int, duration_ticks: int, chord_id: 
         "string": note.string,
         "fret": note.value,
         "chord_id": chord_id,
-        "hopo": effect.hammer,
+        "hammer_on": is_hopo and (previous_fret is None or note.value >= previous_fret),
+        "pull_off": is_hopo and (previous_fret is not None and note.value < previous_fret),
         "slide_in": any(s in _SLIDE_IN_TYPES for s in effect.slides),
         "slide_out": any(s in _SLIDE_OUT_TYPES for s in effect.slides),
         "palm_mute": effect.palmMute,
@@ -72,6 +85,8 @@ def dump_ir(path: str | Path, track_index: int = 0) -> list[dict[str, Any]]:
 
     notes_ir: list[dict[str, Any]] = []
     chord_counter = 0
+    previous_fret: int | None = None
+    next_is_hopo = False
     for measure in track.measures:
         voice = measure.voices[0]
         for beat in voice.beats:
@@ -82,6 +97,10 @@ def dump_ir(path: str | Path, track_index: int = 0) -> list[dict[str, Any]]:
                 chord_id = chord_counter
                 chord_counter += 1
             for note in beat.notes:
-                notes_ir.append(_note_to_ir(note, beat.start, beat.duration.time, chord_id))
+                notes_ir.append(
+                    _note_to_ir(note, beat.start, beat.duration.time, chord_id, next_is_hopo, previous_fret)
+                )
+                previous_fret = note.value
+                next_is_hopo = note.effect.hammer
 
     return notes_ir
