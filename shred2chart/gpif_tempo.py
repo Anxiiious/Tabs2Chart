@@ -43,15 +43,11 @@ def _parse_time_signature(master_bar: ET.Element, previous: tuple[int, int]) -> 
     return int(numerator_text), int(denominator_text)
 
 
-def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
-    """Return a tick-ordered list of tempo and time-signature events.
-
-    Each event is one of:
-      {"tick": int, "type": "tempo", "bpm": float}
-      {"tick": int, "type": "time_signature", "numerator": int, "denominator": int}
-    """
-    root = ET.fromstring(xml_text)
-
+def compute_bar_grid(root: ET.Element) -> tuple[list[int], list[tuple[int, int]]]:
+    """Walk <MasterBars> in order and return, per bar index: its starting
+    tick and its (numerator, denominator) time signature. Shared with
+    shred2chart.ir_gpif, which needs the same per-bar tick grid to place
+    notes."""
     master_bars = root.findall("./MasterBars/MasterBar")
     if not master_bars:
         raise GpifFormatError("no <MasterBars><MasterBar> elements found")
@@ -65,6 +61,18 @@ def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
         bar_starts.append(tick)
         bar_signatures.append(last_sig)
         tick += _bar_length_ticks(*last_sig)
+    return bar_starts, bar_signatures
+
+
+def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
+    """Return a tick-ordered list of tempo and time-signature events.
+
+    Each event is one of:
+      {"tick": int, "type": "tempo", "bpm": float}
+      {"tick": int, "type": "time_signature", "numerator": int, "denominator": int}
+    """
+    root = ET.fromstring(xml_text)
+    bar_starts, bar_signatures = compute_bar_grid(root)
 
     events: list[dict[str, Any]] = []
     previous_sig: tuple[int, int] | None = None

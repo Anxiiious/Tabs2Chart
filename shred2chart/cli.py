@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import gpif_tempo, gpx_reader, tempo
+from . import gpif_tempo, gpx_reader, ir_gp, ir_gpif, tempo
 
 _CONTAINER_SUFFIXES = {".gp", ".gpx"}
 
@@ -56,6 +56,53 @@ def _cmd_dump_tempo(args: argparse.Namespace) -> int:
         print(f"wrote {args.out} ({len(events)} events)")
     else:
         print(json.dumps(events, indent=2))
+    return 0
+
+
+def _cmd_list_tracks(args: argparse.Namespace) -> int:
+    path = Path(args.gp_file)
+    try:
+        if path.suffix.lower() in _CONTAINER_SUFFIXES:
+            xml_text = gpx_reader.extract_gpif(path)
+            tracks = ir_gpif.list_tracks(xml_text)
+        else:
+            tracks = ir_gp.list_tracks(path)
+    except (gpx_reader.GpxFormatError, gpif_tempo.GpifFormatError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"error parsing {path}: {e}", file=sys.stderr)
+        return 1
+
+    for index, name in tracks:
+        print(f"  {index}: {name}")
+    print("\nPass the number you want to `dump-ir` with --track (default: 0).")
+    return 0
+
+
+def _dump_ir(path: Path, track_index: int) -> list[dict]:
+    if path.suffix.lower() in _CONTAINER_SUFFIXES:
+        xml_text = gpx_reader.extract_gpif(path)
+        return ir_gpif.dump_ir(xml_text, track_index=track_index)
+    return ir_gp.dump_ir(path, track_index=track_index)
+
+
+def _cmd_dump_ir(args: argparse.Namespace) -> int:
+    path = Path(args.gp_file)
+    try:
+        notes = _dump_ir(path, args.track)
+    except (gpx_reader.GpxFormatError, gpif_tempo.GpifFormatError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"error parsing {path}: {e}", file=sys.stderr)
+        return 1
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(notes, indent=2), encoding="utf-8")
+        print(f"wrote {args.out} ({len(notes)} notes)")
+    else:
+        print(json.dumps(notes, indent=2))
     return 0
 
 
@@ -157,6 +204,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tempo.add_argument("-o", "--out", help="write JSON to this path instead of stdout")
     p_tempo.set_defaults(func=_cmd_dump_tempo)
+
+    p_tracks = sub.add_parser(
+        "list-tracks", help="list a file's tracks and their index, to pick one for dump-ir"
+    )
+    p_tracks.add_argument("gp_file", help="path to a .gp/.gpx/.gp3/.gp4/.gp5 file")
+    p_tracks.set_defaults(func=_cmd_list_tracks)
+
+    p_ir = sub.add_parser(
+        "dump-ir",
+        help="dump per-note data (tick, pitch, string, fret, techniques) for one track",
+    )
+    p_ir.add_argument("gp_file", help="path to a .gp/.gpx/.gp3/.gp4/.gp5 file")
+    p_ir.add_argument(
+        "--track", type=int, default=0, help="track index to dump (see `list-tracks`; default: 0)"
+    )
+    p_ir.add_argument("-o", "--out", help="write JSON to this path instead of stdout")
+    p_ir.set_defaults(func=_cmd_dump_ir)
 
     p_verify = sub.add_parser(
         "verify-m0",

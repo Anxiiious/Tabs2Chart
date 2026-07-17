@@ -42,12 +42,14 @@ the tool until this is green again.
 
 ## 3. What you can run today
 
-Three commands exist so far, run as `shred2chart <command>`:
+Commands so far, run as `shred2chart <command>`:
 
 | Command | What it does |
 |---|---|
 | `shred2chart dump-gpif song.gp` | Pulls the raw `score.gpif` XML out of a `.gp` or `.gpx` file and saves it next to it. |
 | `shred2chart dump-tempo song.gp` | Prints every tempo/time-signature change found in the file, as JSON. Works directly on `.gp`/`.gpx`, or on a `.gp3`/`.gp4`/`.gp5` via PyGuitarPro. |
+| `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
+| `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties) — as JSON. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 None of these produce a playable Clone Hero chart yet — that's a later milestone (M3/M4 in the
@@ -56,16 +58,25 @@ game plan).
 ## 4. Your next concrete step
 
 **If your tab is a `.gp` file** (modern Guitar Pro 7/8 — this turned out to be what real Sheet
-Happens tabs actually are): you're already most of the way there. Just run:
+Happens tabs actually are): you're already most of the way there. Run:
 
 ```bash
 shred2chart dump-tempo your_song.gp
+shred2chart list-tracks your_song.gp
+shred2chart dump-ir your_song.gp --track N    # pick N from list-tracks — see note below
 ```
 
-No conversion, no TuxGuitar, no extra app needed — it reads the tempo map straight out of the
-file. Check the printed BPM values and bar positions against what you'd expect for that song. If
-that looks right, tell your coding agent — that confirms milestone **M0** for this file, and the
-next step becomes M1 (pulling out the actual notes, not just tempo).
+No conversion, no TuxGuitar, no extra app needed — it reads everything straight out of the file.
+**Pick the track carefully**: in real files seen so far, track 0 is sometimes "Rhythm Guitar" while
+the interesting part is "Lead Guitar" at track 1 — `list-tracks` shows you the names so you're not
+guessing.
+
+The most valuable check you can do right now (this is milestone **M1**'s own verification step,
+and no coding agent can do it — it needs a human with the Guitar Pro app or TuxGuitar open):
+open the same song in Guitar Pro/TuxGuitar side-by-side with the `dump-ir` output, and spot-check
+that the note count and a few positions match what you see on the actual tab. Tell your coding
+agent what you find either way — a mismatch is exactly the kind of thing worth catching now,
+before more is built on top of it.
 
 **If your tab is an older `.gpx` file** (Guitar Pro 6): this format needs an extra verification
 step, since reading it directly relies on a reverse-engineered (unofficial) spec that hasn't been
@@ -98,8 +109,12 @@ says every session must record it in the "Current State" section before moving o
   in that older format.
 - The code that reads tempo data out of `.gp3`/`.gp4`/`.gp5` files (PyGuitarPro) is tested against
   a real generated Guitar Pro file.
-- Nothing writes an actual `.chart` file yet, and note/technique data (as opposed to just tempo)
-  hasn't been tackled — that's milestone M1 onward.
+- Per-note data (pitch, string, fret, chord grouping, techniques like hammer-on/pull-off, slides,
+  palm mute, bends, taps, vibrato, tremolo picking) is now extracted for both `.gp`/`.gpx` and
+  `.gp3`/`.gp4`/`.gp5` files (`dump-ir`), and every technique flag has shown up with a plausible
+  count against a real file. This is milestone M1, and it's not fully checked off yet — it still
+  needs a human to spot-check the output against the tab open in actual Guitar Pro (see §4 above).
+- Nothing writes an actual `.chart` file yet — that's milestone M3 onward, once M1 wraps up.
 
 See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
 the detailed, up-to-date picture.
@@ -110,7 +125,9 @@ the detailed, up-to-date picture.
 shred2chart/          the actual tool (Python package)
   gpx_reader.py        reads .gp/.gpx container files directly, extracts score.gpif
   gpif_tempo.py         reads tempo/time-signature data out of a score.gpif XML
+  ir_gpif.py            reads per-note data out of a score.gpif XML
   tempo.py              reads tempo data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
+  ir_gp.py               reads per-note data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   cli.py                the `shred2chart` command
 tests/                 automated tests (run with `pytest`)
 test_data/             put your real .gpx/.gp5 files here (git-ignored)
