@@ -1,20 +1,27 @@
-"""Reader for Guitar Pro 6 .gpx containers (the BCFS/BCFZ format).
+"""Reader for Guitar Pro container files — both the legacy GP6 `.gpx`
+format and the modern GP7/8 `.gp` format — down to their contained
+`score.gpif` XML (the actual notation data: notes, tempo automations, etc).
 
-A .gpx file is NOT a zip. It's either a raw BCFS "virtual filesystem" or
-that same filesystem compressed with a proprietary scheme called BCFZ.
-Inside the filesystem sits `score.gpif`, an XML file with the actual
-notation data (notes, tempo automations, etc).
+Two containers in the wild, handled transparently here:
 
-This implementation follows the format as reverse-engineered by the
-rust-gpx-reader project (github.com/Antti/rust-gpx-reader), the most
-complete public writeup we found. It has NOT yet been validated against
-a real Sheet Happens .gpx file (see SHRED2CHART_GAMEPLAN.md, M0) — treat
-first real-world runs as the actual test of this module.
+- **GP7/8 `.gp`**: a plain zip archive (`Content/score.gpif` inside).
+  Real Sheet Happens tabs turned out to be this format — see
+  SHRED2CHART_GAMEPLAN.md's Current State for how that was confirmed.
+  GP8 files can have an *encrypted* score.gpif; we detect that case and
+  raise a clear error rather than silently returning garbage.
+- **GP6 `.gpx`**: NOT a zip. Either a raw BCFS "virtual filesystem" or
+  that same filesystem compressed with a proprietary scheme called BCFZ.
+  This half of the reader follows the format as reverse-engineered by
+  the rust-gpx-reader project (github.com/Antti/rust-gpx-reader), the
+  most complete public writeup we found, and is unit-tested against
+  hand-built fixtures but has not been exercised on a real `.gpx` file
+  (we haven't encountered one yet — every real sample so far has been
+  the GP7 zip format above).
 
-One correction versus that reference: its back-reference copy loop used
-`min(length, offset)`, which truncates the classic LZ77 case where
-length > offset (an overlapping run, e.g. "repeat the last byte 10
-times"). We copy byte-by-byte instead, which handles overlap correctly.
+  One correction versus that reference: its back-reference copy loop used
+  `min(length, offset)`, which truncates the classic LZ77 case where
+  length > offset (an overlapping run, e.g. "repeat the last byte 10
+  times"). We copy byte-by-byte instead, which handles overlap correctly.
 """
 from __future__ import annotations
 
@@ -151,17 +158,25 @@ def unpack_bcfs(payload: bytes) -> list[ContainedFile]:
     return files
 
 
+def _read_zip_container(data: bytes) -> list[ContainedFile]:
+    """Read a GP7/8 '.gp' file, which is just a plain zip archive."""
+    files = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            files.append(ContainedFile(name=info.filename, data=zf.read(info)))
+    return files
+
+
 def read_gpx_bytes(data: bytes) -> list[ContainedFile]:
-    """Parse raw .gpx file bytes into the files it contains."""
+    """Parse raw Guitar Pro container bytes (`.gp` or `.gpx`) into the
+    files they contain."""
     if len(data) < 4:
-        raise GpxFormatError("file too short to be a .gpx container")
+        raise GpxFormatError("file too short to be a Guitar Pro container")
 
     if zipfile.is_zipfile(io.BytesIO(data)):
-        raise GpxFormatError(
-            "this file is a plain zip archive, not a GP6 .gpx container — "
-            "it's likely a Guitar Pro 7/8 '.gp' file. Unzip it directly to "
-            "get score.gpif instead of using this reader."
-        )
+        return _read_zip_container(data)
 
     magic = data[:4]
     if magic == MAGIC_BCFZ:
@@ -176,21 +191,35 @@ def read_gpx_bytes(data: bytes) -> list[ContainedFile]:
         return unpack_bcfs(data[4:])
     else:
         raise GpxFormatError(
-            f"unrecognized .gpx magic {magic!r} (expected BCFZ or BCFS). "
-            "Guitar Pro 7/8 '.gp' files are plain zip archives, not GPX — "
-            "if that's what you have, unzip it directly instead of using this reader."
+            f"unrecognized magic {magic!r} — not a zip, and not BCFZ/BCFS either. "
+            "This doesn't look like a Guitar Pro .gp or .gpx file."
         )
 
 
 def read_gpx(path: str | Path) -> list[ContainedFile]:
-    """Parse a .gpx file on disk into the files it contains."""
+    """Parse a Guitar Pro container file (`.gp` or `.gpx`) on disk into
+    the files it contains."""
     with open(path, "rb") as f:
         return read_gpx_bytes(f.read())
 
 
 def extract_gpif(path: str | Path) -> str:
-    """Extract and decode the score.gpif XML from a .gpx file."""
+    """Extract and decode the score.gpif XML from a `.gp`/`.gpx` file."""
     for contained in read_gpx(path):
         if contained.name.lower().endswith(".gpif"):
-            return contained.data.decode("utf-8")
-    raise GpxFormatError("no *.gpif file found inside this .gpx container")
+            try:
+                text = contained.data.decode("utf-8")
+            except UnicodeDecodeError as e:
+                raise GpxFormatError(
+                    "score.gpif isn't valid UTF-8 text — if this is a Guitar Pro 8 "
+                    "file, its content may be encrypted; this tool doesn't support "
+                    "that yet"
+                ) from e
+            if "<GPIF" not in text[:200]:
+                raise GpxFormatError(
+                    "score.gpif doesn't look like GPIF XML (got unexpected content "
+                    "where an XML header should be) — it may be encrypted or in an "
+                    "unrecognized variant of the format"
+                )
+            return text
+    raise GpxFormatError("no *.gpif file found inside this container")

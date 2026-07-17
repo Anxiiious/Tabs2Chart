@@ -18,6 +18,7 @@ from shred2chart.gpx_reader import (
     SECTOR_SIZE,
     GpxFormatError,
     decompress_bcfz,
+    extract_gpif,
     read_gpx_bytes,
     unpack_bcfs,
 )
@@ -129,12 +130,25 @@ def test_read_gpx_bytes_uncompressed_bcfs():
     assert files[0].data == b"<GPIF>ok</GPIF>"
 
 
-def test_read_gpx_bytes_rejects_zip():
+def test_read_gpx_bytes_reads_zip_container():
+    # Real Sheet Happens tabs turned out to be this format (GP7's plain-zip
+    # ".gp", not the legacy GP6 BCFS ".gpx") — see SHRED2CHART_GAMEPLAN.md.
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("Content/score.gpif", "<GPIF/>")
-    with pytest.raises(GpxFormatError, match="zip"):
-        read_gpx_bytes(buf.getvalue())
+        zf.writestr("Content/score.gpif", '<?xml version="1.0"?><GPIF>hi</GPIF>')
+        zf.writestr("VERSION", "7.0")
+    files = {f.name: f.data for f in read_gpx_bytes(buf.getvalue())}
+    assert files["Content/score.gpif"] == b'<?xml version="1.0"?><GPIF>hi</GPIF>'
+    assert files["VERSION"] == b"7.0"
+
+
+def test_extract_gpif_from_zip_container(tmp_path):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("Content/score.gpif", '<?xml version="1.0"?><GPIF>hi</GPIF>')
+    gp_file = tmp_path / "song.gp"
+    gp_file.write_bytes(buf.getvalue())
+    assert extract_gpif(gp_file) == '<?xml version="1.0"?><GPIF>hi</GPIF>'
 
 
 def test_read_gpx_bytes_rejects_unknown_magic():
