@@ -49,7 +49,7 @@ Commands so far, run as `shred2chart <command>`:
 | `shred2chart dump-gpif song.gp` | Pulls the raw `score.gpif` XML out of a `.gp` or `.gpx` file and saves it next to it. |
 | `shred2chart dump-tempo song.gp` | Prints every tempo/time-signature change found in the file, as JSON. Works directly on `.gp`/`.gpx`, or on a `.gp3`/`.gp4`/`.gp5` via PyGuitarPro. |
 | `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
-| `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties) — as JSON. |
+| `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide in/out, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties, accent, ghost note) — as JSON. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 None of these produce a playable Clone Hero chart yet — that's a later milestone (M3/M4 in the

@@ -47,6 +47,25 @@ Confidence notes (see SHRED2CHART_GAMEPLAN.md for the fuller picture):
   looked like in context).
 - tremolo_picked: a <Tremolo> element on the *beat*, not the note; we
   copy it onto every note in that beat since the IR is note-centric.
+- accent: a direct <Accent>N</Accent> child of <Note> (like Vibrato),
+  confirmed in real data (always N=1 so far). ir_gp.py's PyGuitarPro
+  path distinguishes a heavier accent level (0x40 flag bit) that we've
+  never seen a second value for here, so both just become one `accent`
+  bool.
+- ghost_note: PyGuitarPro's side of this exposes a real `ghostNote` flag
+  (confirmed in its gp3.py/gp5.py source), but neither real GPIF file
+  we've seen contains anything named "Ghost" — this song's tab may
+  simply not use the technique, or GP7 calls it something else. Exposed
+  here as an always-`False` stub rather than guessed, so the two
+  extractors' output shapes match; fix once a real example turns up.
+
+Note for Stage 4 (not handled here — M1's job is a faithful raw dump):
+per editor-on-fire's own importer, a tied note shouldn't be treated as a
+new note event at all — it extends the *previous* note's sustain
+("alter the previous note's length to include the tie note"). This IR
+reports every tied note as its own entry with `tied: True`, which is the
+right raw data, but whatever consumes it for note-mapping should merge
+tied notes into the prior note's duration rather than a separate attack.
 """
 from __future__ import annotations
 
@@ -128,6 +147,8 @@ def _note_to_ir(
         "let_ring": note_el.find("LetRing") is not None,
         "tied": note_el.find("Tie") is not None,
         "tremolo_picked": tremolo_picked,
+        "accent": note_el.find("Accent") is not None,
+        "ghost_note": False,  # no confirmed GPIF property for this yet — see module docstring
     }
 
 

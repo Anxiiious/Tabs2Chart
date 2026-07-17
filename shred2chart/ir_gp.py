@@ -23,6 +23,23 @@ hammer-on). Chords make "the previous note" ambiguous (which string?);
 we track it per the track's linear note sequence regardless of string,
 same simplification EOF itself uses — fine for monophonic lead lines,
 unreliable right at a chord boundary.
+
+ghost_note/accent: also cross-checked against EOF — `ghostNote` and
+`accentuatedNote`/`heavyAccentuatedNote` are real, distinct NoteEffect
+fields (confirmed in PyGuitarPro's own gp3.py/gp5.py readers, bits 0x04
+and 0x40 of the note flag byte) that an earlier version of this module
+simply didn't expose. `accent` folds both accent levels into one bool
+since no real file seen so far distinguishes them meaningfully for our
+purposes.
+
+Note for Stage 4 (not handled here — M1's job is a faithful raw dump):
+EOF's tie handling doesn't treat a tied note as a new note event at all;
+it extends the *previous* note's sustain instead ("alter the previous
+note's length to include the tie note"). Our IR currently reports every
+tied note as its own entry with `tied: True` — that's the right raw
+data, but whatever consumes this IR for note-mapping should merge tied
+notes into the prior note's duration rather than treating them as
+separate attacks.
 """
 from __future__ import annotations
 
@@ -64,6 +81,8 @@ def _note_to_ir(
         "tremolo_picked": effect.isTremoloPicking,
         "let_ring": effect.letRing,
         "tied": note.type == guitarpro.NoteType.tie,
+        "ghost_note": effect.ghostNote,
+        "accent": effect.accentuatedNote or effect.heavyAccentuatedNote,
     }
 
 

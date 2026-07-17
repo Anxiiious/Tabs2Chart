@@ -64,6 +64,7 @@ def test_dump_ir_single_notes_and_chord_and_techniques():
     notes = """
 <Note id="0">
 <Tie origin="false" destination="true" />
+<Accent>1</Accent>
 <Properties>
 <Property name="Fret"><Fret>5</Fret></Property>
 <Property name="Midi"><Number>60</Number></Property>
@@ -110,6 +111,8 @@ def test_dump_ir_single_notes_and_chord_and_techniques():
     assert first["hammer_on"] is True
     assert first["pull_off"] is False
     assert first["tap"] is True
+    assert first["accent"] is True
+    assert first["ghost_note"] is False  # always False: no confirmed GPIF property yet
 
     # Beat 1 was a rest (still advances the clock by one quarter note),
     # so the chord in beat 2 starts a full quarter note after beat 0.

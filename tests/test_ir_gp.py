@@ -35,6 +35,8 @@ def test_dump_ir_chord_grouping_and_flags(tmp_path):
     solo_note = gp.Note(single_note_beat, value=5, string=3)
     solo_note.type = gp.NoteType.normal
     solo_note.effect.palmMute = True
+    solo_note.effect.ghostNote = True
+    solo_note.effect.accentuatedNote = True
     single_note_beat.notes.append(solo_note)
     voice.beats.append(single_note_beat)
 
@@ -63,6 +65,8 @@ def test_dump_ir_chord_grouping_and_flags(tmp_path):
     assert first["string"] == 3
     assert first["chord_id"] is None
     assert first["palm_mute"] is True
+    assert first["ghost_note"] is True
+    assert first["accent"] is True
 
     # Chord note order isn't guaranteed to survive the round trip (GP5
     # seems to re-sort by string), so match by string instead of index.
