@@ -10,7 +10,9 @@ import json
 import sys
 from pathlib import Path
 
-from . import gpif_tempo, gpx_reader, ir_gp, ir_gpif, tempo
+import xml.etree.ElementTree as ET
+
+from . import blend, chart_writer, gpif_tempo, gpx_reader, ir_gp, ir_gpif, mapper, tempo
 
 _CONTAINER_SUFFIXES = {".gp", ".gpx"}
 
@@ -103,6 +105,95 @@ def _cmd_dump_ir(args: argparse.Namespace) -> int:
         print(f"wrote {args.out} ({len(notes)} notes)")
     else:
         print(json.dumps(notes, indent=2))
+    return 0
+
+
+def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
+    """Default track selection for `convert` when --tracks isn't given:
+    every track whose name suggests guitar, skipping bass/drums. Order
+    is file order, which doubles as the blend tie-breaker."""
+    chosen = []
+    for track_id, name in tracks:
+        lowered = (name or "").lower()
+        if "bass" in lowered or "drum" in lowered:
+            continue
+        if "guit" in lowered or "lead" in lowered or "rhythm" in lowered:
+            chosen.append(track_id)
+    return chosen or [tracks[0][0]]
+
+
+def _cmd_convert(args: argparse.Namespace) -> int:
+    path = Path(args.gp_file)
+    if path.suffix.lower() not in _CONTAINER_SUFFIXES:
+        print(
+            "error: convert currently supports .gp/.gpx files only (every real "
+            "Sheet Happens tab seen so far is .gp). For .gp5, ask for this to be extended.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        xml_text = gpx_reader.extract_gpif(path)
+    except gpx_reader.GpxFormatError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    root = ET.fromstring(xml_text)
+    title = (root.findtext("./Score/Title") or path.stem).strip() or path.stem
+    artist = (root.findtext("./Score/Artist") or "Unknown Artist").strip() or "Unknown Artist"
+
+    tracks = ir_gpif.list_tracks(xml_text)
+    if args.tracks:
+        try:
+            track_ids = [int(t) for t in args.tracks.split(",")]
+        except ValueError:
+            print(f"error: --tracks must be comma-separated numbers, got {args.tracks!r}", file=sys.stderr)
+            return 1
+        known = {t for t, _ in tracks}
+        unknown = [t for t in track_ids if t not in known]
+        if unknown:
+            print(f"error: track(s) {unknown} not in this file. Available:", file=sys.stderr)
+            for track_id, name in tracks:
+                print(f"  {track_id}: {name}", file=sys.stderr)
+            return 1
+    else:
+        track_ids = _guess_guitar_tracks(tracks)
+
+    names = dict(tracks)
+    print(f"{title} — {artist}")
+    print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
+
+    tempo_events = gpif_tempo.dump_tempo_events(xml_text)
+    sections = gpif_tempo.dump_sections(xml_text)
+
+    # Blend at section granularity; if the file has no section markers,
+    # fall back to fixed 8-bar windows so blending still happens at a
+    # phrase-ish scale instead of collapsing to one whole-song pick.
+    blend_spans = sections
+    if not blend_spans and len(track_ids) > 1:
+        bar_starts, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+        blend_spans = [
+            {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
+            for i in range(0, len(bar_starts), 8)
+        ]
+        print("(no section markers in file — blending in 8-bar windows instead)")
+
+    tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
+    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+    chart_notes = mapper.map_notes(blended)
+
+    print(f"\n{len(sections)} section(s), {len(blended)} notes after blending, "
+          f"{len(chart_notes)} chart events:")
+    for choice in choices:
+        print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
+
+    out_dir = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    chart_writer.write_song_folder(
+        out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
+    )
+    print(f"\nwrote {out_dir}/notes.chart and song.ini")
+    print("Drop the song's audio in that folder as song.ogg, then copy the folder "
+          "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
     return 0
 
 
@@ -221,6 +312,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ir.add_argument("-o", "--out", help="write JSON to this path instead of stdout")
     p_ir.set_defaults(func=_cmd_dump_ir)
+
+    p_convert = sub.add_parser(
+        "convert",
+        help="convert a .gp/.gpx file into a Clone Hero song folder (notes.chart + song.ini)",
+    )
+    p_convert.add_argument("gp_file", help="path to a .gp (GP7/8) or .gpx (GP6) file")
+    p_convert.add_argument(
+        "--tracks",
+        help="comma-separated track numbers to blend, in priority order (see `list-tracks`); "
+        "default: every guitar-named track, blended per section",
+    )
+    p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
+    p_convert.add_argument(
+        "--offset-ms", type=int, default=0,
+        help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+    )
+    p_convert.set_defaults(func=_cmd_convert)
 
     p_verify = sub.add_parser(
         "verify-m0",

@@ -64,6 +64,21 @@ def compute_bar_grid(root: ET.Element) -> tuple[list[int], list[tuple[int, int]]
     return bar_starts, bar_signatures
 
 
+def dump_sections(xml_text: str) -> list[dict[str, Any]]:
+    """Return section markers from <MasterBar><Section><Text> elements:
+    [{"tick": int, "bar": int, "name": str}, ...] in song order. Real
+    Sheet Happens files carry these ("Intro", "Verse", ...) and they
+    drive both .chart [Events] output and section-level track blending."""
+    root = ET.fromstring(xml_text)
+    bar_starts, _ = compute_bar_grid(root)
+    sections = []
+    for bar_index, master_bar in enumerate(root.findall("./MasterBars/MasterBar")):
+        text = master_bar.findtext("./Section/Text")
+        if text is not None and text.strip():
+            sections.append({"tick": bar_starts[bar_index], "bar": bar_index, "name": text.strip()})
+    return sections
+
+
 def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
     """Return a tick-ordered list of tempo and time-signature events.
 
