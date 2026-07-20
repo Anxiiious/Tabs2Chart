@@ -51,7 +51,7 @@ Commands so far, run as `shred2chart <command>`:
 | `shred2chart dump-tempo song.gp` | Prints every tempo/time-signature change found in the file, as JSON. Works directly on `.gp`/`.gpx`, or on a `.gp3`/`.gp4`/`.gp5` via PyGuitarPro. |
 | `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
 | `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide in/out, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties, accent, ghost note) — as JSON. |
-| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority, `--offset-ms` for audio sync. |
+| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority; `--audio song.flac` to auto-convert and include `song.ogg`; `--lead-in-bars N` (default 2) for calibration-friendly silence before the first note; `--offset-ms` for fine-tuning audio sync on top of that. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 `convert` is the one that makes something playable; the rest are inspection tools that show you
@@ -120,7 +120,18 @@ says every session must record it in the "Current State" section before moving o
   the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
   next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
   notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
-  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moonscraper.**
+  song with `--audio song.flac` and try it in Clone Hero or Moonscraper.**
+- **Timing fix (2026-07-19):** an actual playtest surfaced a real bug — charts drifted
+  progressively later than the audio, because the converter walked the tab in *written* order
+  instead of the *performance* order Guitar Pro actually plays (repeat barlines, 1st/2nd
+  endings, and D.S. al Coda/Segno-Coda navigation all replay or skip material). This is now
+  simulated (`gpif_tempo.compute_playback_order`) for `.gp` (GP7) files and verified against a
+  real song's embedded section timestamps to within about a second, start to finish. Also added
+  a `--lead-in-bars` flag (default 2) so charts don't start on tick 0 — Clone Hero's audio
+  calibration needs a beat of silence to judge against. **Not yet done:** the in-game playtest
+  of this fixed version hasn't been reported back; the identical bug in the PyGuitarPro
+  (`.gp3`/`.gp4`/`.gp5`) path was left unfixed since no real file needing it has turned up there.
+  See `SHRED2CHART_GAMEPLAN.md` §8's 2026-07-19 entry for the full story.
 
 See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
 the detailed, up-to-date picture.

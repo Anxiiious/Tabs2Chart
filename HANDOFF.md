@@ -35,8 +35,10 @@ All commands start with `shred2chart`. Here's what each does:
 This is what makes the charts. Run it like:
 
 ```bash
-shred2chart convert your_song.gp
+shred2chart convert your_song.gp --audio your_song.flac
 ```
+
+(`--audio` is optional — omit it and just drop `song.ogg` in yourself later, see below.)
 
 It creates a folder `songs/Artist - Title/` with two files:
 - `notes.chart` — the actual chart (lanes, notes, tempo, sections)
@@ -44,10 +46,30 @@ It creates a folder `songs/Artist - Title/` with two files:
 
 **Optional flags:**
 - `--out /path/to/folder` — put the output somewhere else (default is `songs/` folder)
-- `--offset-ms 250` — delay the chart by that many milliseconds (for audio sync)
+- `--audio your_song.flac` — auto-converts and drops in `song.ogg` (needs ffmpeg on PATH, or the bundled `ffmpeg/` folder in this repo)
+- `--lead-in-bars 2` — bars of silence before the first note (default **2**), so the highway scrolls before play starts and Clone Hero's audio calibration has something to judge against. Set to `0` to disable.
+- `--offset-ms 250` — *extra* fine-tune offset on top of the lead-in, for after you calibrate in Moonscraper/Clone Hero (default 0)
 - `--tracks 1,0` — pick specific tracks and their order (default: auto-picks guitar tracks)
 
+## Important: the chart now tracks repeats and D.S. al Coda navigation
+
+Real tabs don't play top-to-bottom in the order they're written — repeat barlines replay
+sections, 1st/2nd endings are conditional, and some songs jump around with D.S. al Coda
+(Segno/Coda) markers. **If you playtest a song and the guitar is out of sync — especially
+if the drift gets *worse* the longer the song plays** — that's this exact issue. It should
+already be fixed for `.gp` (GP7 zip) files: `shred2chart` now simulates the real play order
+before charting anything, instead of walking the tab in written order. Sanity check to
+avoid re-diagnosing something already fixed: `git log --oneline` should show commits
+mentioning "repeat" and "D.S. al Coda" — if a new song you convert still drifts, tell your
+coding agent, this might be a case (nested Codas, D.C./Fine markers) the fix doesn't cover
+yet (see `SHRED2CHART_GAMEPLAN.md` §10, Open Questions).
+
 ## After You Convert a Song
+
+**If you passed `--audio your_song.flac` to `convert`**, `song.ogg` is already in the
+folder — skip to step 4.
+
+**Otherwise:**
 
 1. Take the generated folder (e.g., `songs/Senses Fail - Still Searching/`)
 2. Convert your audio file from FLAC to OGG:
@@ -85,10 +107,16 @@ It creates a folder `songs/Artist - Title/` with two files:
 
 1. Pick a song from your Sheet Happens album
 2. Run `shred2chart list-tracks song.gp` to see what's in it
-3. Run `shred2chart convert song.gp` to make a chart
-4. Convert the audio to OGG and drop it in the folder
-5. Test in Clone Hero or Moonscraper
-6. If it doesn't sync right, use `--offset-ms` to adjust
+3. Run `shred2chart convert song.gp --audio song.flac` to make a chart with audio included
+4. Test in Clone Hero or Moonscraper
+5. If it still doesn't sync right after the built-in lead-in, use `--offset-ms` to fine-tune
+   (see "Important: the chart now tracks repeats..." above if the drift gets *worse* over
+   the course of the song — that's a specific, mostly-fixed bug, not a calibration issue)
+
+**Outstanding as of 2026-07-19:** the repeat/D.S. al Coda timing fix and the 2-bar lead-in
+are both implemented and verified mathematically, but haven't had their in-game playtest
+result reported back yet. If you're picking this up, that's the natural next thing to
+check and log in `SHRED2CHART_GAMEPLAN.md` §8 (Current State).
 
 ## Questions?
 
