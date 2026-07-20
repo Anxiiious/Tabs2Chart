@@ -127,8 +127,36 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
+def _safe_path_part(value: str) -> str:
+    """Keep metadata-derived output paths within the songs directory."""
+    cleaned = value.replace("/", "_").replace("\\", "_").strip(" .")
+    return cleaned or "Untitled"
+
+
 def _default_output_dir(artist: str, title: str) -> Path:
-    return Path(f"songs/{artist} - {title}")
+    return Path("songs") / f"{_safe_path_part(artist)} - {_safe_path_part(title)}"
+
+
+def _prepare_audio(audio: str | Path, out_dir: Path) -> Path:
+    source = Path(audio).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"audio file does not exist: {source}")
+    target = out_dir / "song.ogg"
+    if source.suffix.lower() == ".ogg":
+        shutil.copy2(source, target)
+        return target
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("non-OGG audio requires ffmpeg on PATH")
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(source), "-vn", "-acodec", "libvorbis", str(target)],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "unknown ffmpeg error"
+        raise RuntimeError(f"ffmpeg could not convert audio: {detail}") from exc
+    return target
 
 
 def _prompt_convert_options(
@@ -262,27 +290,12 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     )
     audio_source = None
     if args.audio:
-        audio_source = Path(args.audio).expanduser()
-        if not audio_source.is_file():
-            print(f"error: audio file does not exist: {audio_source}", file=sys.stderr)
+        try:
+            audio_source = Path(args.audio).expanduser()
+            _prepare_audio(audio_source, out_dir)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return 1
-        audio_target = out_dir / "song.ogg"
-        if audio_source.suffix.lower() == ".ogg":
-            shutil.copy2(audio_source, audio_target)
-        else:
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                print("error: non-OGG audio requires ffmpeg on PATH", file=sys.stderr)
-                return 1
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y", "-i", str(audio_source), "-vn", "-acodec", "libvorbis",
-                     str(audio_target)],
-                    check=True, capture_output=True, text=True,
-                )
-            except subprocess.CalledProcessError as exc:
-                print(f"error: ffmpeg could not convert audio: {exc.stderr.strip()}", file=sys.stderr)
-                return 1
     errors = validation.validate_song_folder(
         out_dir, title, artist, tempo_events, audio_required=bool(args.audio)
     )
