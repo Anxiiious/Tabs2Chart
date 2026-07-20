@@ -59,13 +59,14 @@ class TestBlend:
 
 class TestMapper:
     def test_tick_conversion_and_first_note_anchors(self):
-        # First note still seeds the anchor from absolute pitch (pitch % 5),
-        # matching the old baseline for exactly one note; the second note's
-        # lane is RELATIVE to that anchor, not its own absolute pitch % 5.
+        # The first note seeds the anchor at the centered lane (2),
+        # regardless of its absolute pitch (62 % 5 also happens to be 2,
+        # but that's coincidence, not the mechanism - see _assign_lanes).
+        # The second note's lane is RELATIVE to that anchor.
         notes = map_notes([_note(0, pitch=62, fret=5), _note(960, pitch=63, fret=6)])
-        assert notes[0].tick == 0 and notes[0].lanes == [62 % 5]
+        assert notes[0].tick == 0 and notes[0].lanes == [2]
         assert notes[1].tick == CHART_RESOLUTION
-        assert notes[1].lanes == [(62 % 5) + 1]  # +1 semitone, in-box step, anchor unmoved
+        assert notes[1].lanes == [3]  # +1 semitone, in-box step, anchor unmoved
 
     def test_open_chug_on_lowest_string(self):
         # String 1 tuned to pitch 36 (fret 0), string 2 higher.
@@ -121,29 +122,36 @@ class TestLaneContour:
         return [{"pitch": pitch, "fret": fret, "string": 1}]
 
     def test_notes_within_one_hand_position_stay_one_step_from_anchor(self):
-        # Anchor at 60 (lane 0). Every later note in this test is within the
-        # 4-semitone box, so the anchor is static and each note's lane is a
-        # PURE function of (anchor_lane, direction from anchor) - not an
-        # incremental walk. Same direction from the same anchor -> same lane,
-        # which is exactly what gives pattern stability its guarantee.
+        # Anchor at 60 seeds to the MIDDLE lane (2) regardless of absolute
+        # pitch - see _assign_lanes: an edge seed leaves no headroom in one
+        # direction and clamps nearby notes into a wall (the real "section
+        # [D]" bug this centered seed fixes). Every later note in this test
+        # is within the 4-semitone box, so the anchor is static and each
+        # note's lane is a PURE function of (anchor_lane, direction from
+        # anchor) - not an incremental walk. Same direction from the same
+        # anchor -> same lane, which is exactly what gives pattern
+        # stability its guarantee.
         contour = _LaneContour()
         lanes = [
             _assign_lanes(self._single(p), None, contour)[0] for p in (60, 62, 64)
         ]
-        assert lanes == [0, 1, 1]  # 62 and 64 are both "+1 from the static anchor"
+        assert lanes == [2, 3, 3]  # seeded at 2; 62 and 64 are both "+1 from anchor"
         assert contour.anchor_pitch == 60  # anchor never moved
 
     def test_ascending_run_crossing_hand_positions_is_monotonic(self):
         # A run that crosses hand-position boundaries (leaps > 4 semitones
-        # each step) re-centers the anchor each time and climbs in
-        # proportion to the leap size - here each +6 semitone leap is
-        # round(6/3)=2 lanes, so it climbs 0 -> 2 -> 4 -> clamped at 4.
+        # each step) re-centers the anchor EVERY step - and the anchor
+        # always re-centers back to CENTER_LANE (2), not the just-computed
+        # lane, so it has headroom again next time. Each +6 semitone leap
+        # is independently round(6/3)=2 lanes from that fresh center (2),
+        # landing this note at 2+2=4 every time.
         contour = _LaneContour()
         lanes = [
             _assign_lanes(self._single(p), None, contour)[0] for p in (60, 66, 72, 78)
         ]
-        assert lanes == [0, 2, 4, 4]
+        assert lanes == [2, 4, 4, 4]
         assert contour.anchor_pitch == 78  # re-centered on every leap
+        assert contour.anchor_lane == 2  # re-centers to CENTER_LANE, not the clamped 4
 
     def test_descending_run_clamps_at_zero(self):
         contour = _LaneContour()
@@ -177,13 +185,18 @@ class TestLaneContour:
 
     def test_leap_beyond_hand_position_recenters_anchor(self):
         contour = _LaneContour()
-        _assign_lanes(self._single(60), None, contour)  # anchor=60, lane=0
+        _assign_lanes(self._single(60), None, contour)  # anchor=60, lane=2 (centered seed)
         lane = _assign_lanes(self._single(72), None, contour)[0]  # delta=12
         assert contour.anchor_pitch == 72  # re-centered on the new pitch
-        # round(12/3)=4 lanes of movement, proportional to the leap size -
-        # not a flat +-1 (that was the v1 bug that caused "stuck high"
-        # oscillation on real wide-ranging lead lines).
+        # This note's own lane is proportional to the leap size (v2 fix:
+        # round(12/3)=4 lanes from the old anchor's lane, not a flat +-1).
         assert lane == 4
+        # But the ANCHOR going forward re-centers to CENTER_LANE (2), not
+        # the edge value this note landed on - otherwise the next leap
+        # re-centers from an edge with no headroom, reproducing the same
+        # clamping-wall bug one leap later (confirmed on a real leap right
+        # before "Still Searching" section [D]).
+        assert contour.anchor_lane == 2
 
     def test_open_note_bypasses_contour_and_does_not_touch_anchor(self):
         contour = _LaneContour()
@@ -215,6 +228,31 @@ class TestLaneContour:
         assert len(set(lanes_after_first_occurrence)) == 1, (
             f"61 landed on inconsistent lanes after settling: {lanes_after_first_occurrence}"
         )
+
+    def test_real_section_d_regression_first_notes_not_stuck_at_edge(self):
+        # Regression guard for a real bug that showed up THREE times: once
+        # at the very first note of a track (fixed by seeding at
+        # CENTER_LANE instead of pitch % 5), again mid-song when an earlier
+        # leap happened to re-center the anchor onto an edge lane right
+        # before this exact passage (Still Searching, track 1, start of
+        # section [D], tick 76800+), and a third time even after the
+        # re-center-to-CENTER_LANE fix: an anchor already stuck at an edge
+        # (reproduced here by seeding anchor_pitch=69/anchor_lane=4) stayed
+        # stuck through a whole cluster of in-box notes (69/71/73), none of
+        # which was individually a big enough leap (>4 semitones from 69)
+        # to trigger the re-center. Error-leaking fixes this: an in-box
+        # move that clamps against the lane-4 wall (e.g. 69->73) shifts the
+        # anchor's reference lane down to absorb the hit, so the next
+        # in-box note has headroom instead of clamping again.
+        pitches = [69, 73, 69, 71, 71, 69, 69, 74, 69, 73, 73, 69, 71, 73]
+        contour = _LaneContour()
+        contour.anchor_pitch, contour.anchor_lane = 69, 4  # matches the real bug's state
+        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in pitches]
+        # Exact expected sequence, verified against the real fix's output:
+        # note 2 (73) clamps at the lane-4 wall and leaks the error into
+        # anchor_lane (4->3), which is what un-sticks every note after it.
+        assert lanes == [4, 4, 3, 4, 4, 3, 3, 4, 0, 3, 3, 2, 3, 3]
+        assert len(set(lanes[:8])) > 1, f"first 8 notes stuck on one lane: {lanes[:8]}"
 
 
 class TestChordDisjoint:
@@ -264,10 +302,11 @@ class TestChartWriter:
         assert "0 = TS 4\n" in text  # /4 -> exponent omitted
         assert "768 = TS 6 3" in text  # 6/8 -> exponent 3, tick 3840/5
         assert '0 = E "section Intro"' in text
-        # pitch 40 % 5 = lane 0; 2-quarter sustain (384) trimmed by the
-        # 1/32 gap (24) because the next note starts right at its end.
-        assert "0 = N 0 360" in text
-        assert "384 = N 1 0" in text  # pitch 41 % 5 = lane 1
+        # First note seeds the anchor at the centered lane 2 (not from
+        # absolute pitch); 2-quarter sustain (384) trimmed by the 1/32 gap
+        # (24) because the next note starts right at its end.
+        assert "0 = N 2 360" in text
+        assert "384 = N 3 0" in text  # pitch 41 is +1 semitone -> anchor lane +1
         assert "384 = N 5 0" in text  # forced flag at same tick
 
 

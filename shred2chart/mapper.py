@@ -15,7 +15,12 @@
   against a real lead lick; see SHRED2CHART_GAMEPLAN.md's 2026-07-19
   entry). The static anchor also gives pattern stability for the common
   case: the same riff played twice in the same hand position maps to the
-  identical lane sequence both times.
+  identical lane sequence both times. **Error-leaking** absorbs the case
+  where an in-box move clamps against a lane edge: the clamp error shifts
+  the anchor's reference lane (not its pitch) the opposite way, so later
+  in-box notes get headroom back instead of clamping against the same
+  wall repeatedly - this is what rescues an anchor that's already stuck
+  at an edge with no single note big enough to trigger a re-center.
 - **Ties merge into sustains** (the EOF-confirmed behavior): a note with
   `tied: True` extends the previous note at the same string+pitch
   instead of becoming a new attack.
@@ -77,6 +82,17 @@ SEMITONES_PER_LANE = 3
 # Chord pitches (sorted) more than an octave apart get a lane gap instead
 # of stacking contiguous - adjacent lanes should mean "close together."
 DISJOINT_CHORD_SEMITONES = 12
+
+# The anchor always seeds/re-centers here, not at an absolute-pitch-
+# derived lane: starting or landing at an edge (0 or 4) leaves no headroom
+# in one direction, so a cluster of nearby notes that should spread out
+# instead clamps into a wall until a big enough leap eventually breaks
+# free. Confirmed on two separate real passages of "Still Searching"
+# track 1 - the song's very first note (section start) and a re-center
+# mid-song right before section [D] both happened to land on an edge
+# lane, jamming several genuinely distinct notes onto one button each
+# time. Centering gives equal headroom in both directions every time.
+CENTER_LANE = 2
 
 
 class _LaneContour:
@@ -160,7 +176,7 @@ def _assign_lanes(
         pitch = note["pitch"] or 0
         if contour.anchor_pitch is None:
             contour.anchor_pitch = pitch
-            contour.anchor_lane = pitch % 5
+            contour.anchor_lane = CENTER_LANE
             return [contour.anchor_lane]
 
         delta = pitch - contour.anchor_pitch
@@ -169,18 +185,45 @@ def _assign_lanes(
 
         # Lane movement is proportional to how far the pitch actually
         # moved (not a flat +-1), so a wide leap spreads further across
-        # the neck than a small one - see SEMITONES_PER_LANE above.
+        # the neck than a small one - see SEMITONES_PER_LANE above. This
+        # note's own lane reflects the leap's real direction/magnitude
+        # from the anchor, even when the leap also re-centers below.
         lane_delta = round(delta / SEMITONES_PER_LANE)
         if lane_delta == 0:
             lane_delta = 1 if delta > 0 else -1  # any nonzero delta moves >=1 lane
-        new_lane = max(0, min(4, contour.anchor_lane + lane_delta))
+        target_lane = contour.anchor_lane + lane_delta
+        new_lane = max(0, min(4, target_lane))
+
+        # Error-leak: an in-box move that clamps against a lane edge slides
+        # the anchor's reference lane the opposite way to absorb the hit,
+        # so the NEXT in-box note gets headroom again instead of clamping
+        # against the same wall too - anchor_pitch is untouched, only
+        # anchor_lane moves, otherwise this cancels itself out and buys no
+        # headroom. Fixes a real case where an anchor already stuck at an
+        # edge (e.g. from an earlier leap) stayed stuck through a whole
+        # cluster of in-box notes, none of which was individually a big
+        # enough leap to trigger the re-center below (confirmed against
+        # real note sequence at "Still Searching" section [D], tick 76800+).
+        clamp_error = target_lane - new_lane
+        if clamp_error != 0:
+            contour.anchor_lane -= clamp_error
 
         if abs(delta) > HAND_POSITION_SEMITONES:
-            # Position shift: this note becomes the new anchor, at the
-            # lane just computed - preserves both direction and magnitude
-            # rather than snapping to an absolute-pitch lane.
+            # Position shift: this note becomes the new anchor. Re-center
+            # to CENTER_LANE (not new_lane) so the anchor always has
+            # headroom on both sides going forward - re-centering onto an
+            # edge lane reintroduces the exact same clamping-wall bug the
+            # initial seed above fixes, just triggered mid-song instead of
+            # at note 1 (confirmed on a real leap right before section [D]).
+            # This is a distinct mechanism from the error-leak above: the
+            # error-leak absorbs wall hits within one hand position, this
+            # branch handles a genuine hand-position shift - both are
+            # needed (confirmed: dropping this branch in favor of the
+            # error-leak alone flattens a real wide lead lick, section [E],
+            # from 5 distinct lanes down to 4, because the anchor then
+            # never follows a genuine shift up the neck).
             contour.anchor_pitch = pitch
-            contour.anchor_lane = new_lane
+            contour.anchor_lane = CENTER_LANE
 
         return [new_lane]
 
