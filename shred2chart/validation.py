@@ -33,7 +33,7 @@ def validate_song_folder(
         if parser.get("song", "artist", fallback="") != artist:
             errors.append("song.ini artist does not match chart metadata")
     if not tempo_events:
-        errors.append("timing map contains no tempo or time-signature events")
+        errors.append("timing map contains no tempo events")
     if audio_required and not audio.is_file():
         errors.append(f"missing audio: {audio}")
     return errors

@@ -70,7 +70,7 @@ The manifest (`moon-scraper-manifest.json`) is the hand-off contract. It contain
 version, absolute chart/metadata/audio paths, source metadata, tempo and section events, chart
 event count, and offset. The fork should read JSON from stdin and return exit code 0; its stdout
 and stderr are captured by the adapter. Non-OGG audio is converted to `song.ogg` with `ffmpeg`.
-Without `--audio`, the existing manual Clone Hero/Moonscraper workflow is unchanged.
+Without `--audio`, the existing manual Clone Hero/Moon Scraper workflow is unchanged.
 
 For a guided first conversion, add `--interactive`. It shows the detected tracks, lets you adjust
 the tracks and output folder, warns before writing into a non-empty folder, and reminds you that
@@ -143,7 +143,7 @@ says every session must record it in the "Current State" section before moving o
   the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
   next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
   notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
-  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moonscraper.**
+  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moon Scraper.**
 
 See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
 the detailed, up-to-date picture.

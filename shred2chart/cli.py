@@ -315,7 +315,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         print(f"\nwrote {out_dir}/notes.chart, song.ini, and moon-scraper-manifest.json")
         if args.audio:
             print(f"copied audio to {out_dir}/song.ogg")
-        print("Drop the folder into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
+        print("Drop the folder into Clone Hero's Songs directory (or open notes.chart in Moon Scraper).")
     return 0
 
 
@@ -458,7 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
-        help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+        help="audio offset in milliseconds (calibrate in Moon Scraper later; default 0)",
     )
     p_convert.add_argument(
         "-i", "--interactive", action="store_true",
