@@ -1,25 +1,26 @@
-"""IR notes -> Clone Hero 5-lane note events (Stage 4, naive M3 version).
+"""IR notes -> Clone Hero 5-lane note events (Stage 4, M4 contour version).
 
-This is deliberately the game plan's M3 "emitter skeleton" mapping —
-pitch mod 5, no contour logic — plus the three cheap rules that matter
-most for playability in the target repertoire:
+Lane assignment uses a sliding-window pitch contour tracker that replaces
+the M3 `pitch % 5` naive mapping:
 
-- Ties merge into sustains (the EOF-confirmed behavior): a note with
-  tied: True extends the previous note at the same string+pitch
-  instead of becoming a new attack.
-- Open-string chugs -> open note (N 7): fret 0 on the track's
-  lowest-tuned string. The tuning is inferred from the notes themselves
-  (pitch - fret = the string's tuning), so drop tunings work without
-  any tuning metadata.
+- A rolling pitch window of the last few notes tracks the relative melodic
+  range.  Notes are mapped within 5 lanes proportionally to their position
+  inside that window.
+- The window is reset (and re-centred) at phrase boundaries: either a
+  section-marker tick that was stamped on the note via the `section_tick`
+  field, or a rest of at least one quarter note (IR_TICKS_PER_QUARTER).
+- Repeated identical pitches stay on the same lane (no jitter rule).
+- The open-string chug rule is applied before contour: fret 0 on the
+  lowest-tuned string always maps to open note (N 7), regardless of the
+  contour window.
+
+Additionally retained from M3:
+- Ties merge into sustains (the EOF-confirmed behavior).
+- Chord voicing by harmonic interval with anti-repeat nudge.
 - Technique flags: hammer_on/pull_off -> forced flip (N 5),
-  tap -> tap modifier (N 6, which overrides HOPO per the spec).
-
-Chord voicing: root lane from the root pitch, remaining chord notes
-spread by harmonic interval (see _interval_to_gap) rather than
-forced onto adjacent lanes, capped at 3 lanes wide (game plan rule
-3's cap).
-
-The real contour-based mapping is M4 and replaces _assign_lanes.
+  tap -> tap modifier (N 6, overrides HOPO per spec).
+- Sustain threshold: sub-eighth notes get zero sustain; sustains trimmed
+  by a 1/32-note gap before the next note on that lane.
 
 Tick conversion: IR is 960 ticks/quarter (PyGuitarPro convention),
 .chart is emitted at Resolution=192, so every position/length divides
@@ -31,6 +32,7 @@ GuitarGame_ChartFormats), not from memory, per the game plan's mandate.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +49,15 @@ SUSTAIN_GAP = CHART_RESOLUTION // 8  # 1/32 note = 24
 OPEN_NOTE = 7
 FORCED_FLAG = 5
 TAP_FLAG = 6
+
+# Contour window: track the last N distinct pitches to set the range.
+_CONTOUR_WINDOW = 12
+# Minimum window span in semitones before we start spreading lanes.
+_MIN_WINDOW_SPAN = 4
+# Rest threshold (in IR ticks) that resets the contour window.
+# One bar in 4/4 = 4 quarter notes. Rests shorter than a full bar keep
+# the current phrase context; longer gaps signal a new phrase.
+_REST_RESET_TICKS = IR_TICKS_PER_QUARTER * 4  # 1 bar (3840 ticks in 4/4)
 
 
 @dataclass
@@ -122,35 +133,90 @@ def _interval_to_gap(semitones: int) -> int:
     return 4              # m7, M7, octave
 
 
-def _assign_lanes(
+class _ContourTracker:
+    """Sliding-window pitch contour for lane assignment.
+
+    Maintains a rolling window of recent pitches to define a local pitch
+    range.  New pitches are mapped linearly onto 5 lanes within that range.
+    The window resets at phrase boundaries (explicit reset call) and after
+    long rests (detected from note timestamps).
+    """
+
+    def __init__(self) -> None:
+        self._window: deque[int] = deque(maxlen=_CONTOUR_WINDOW)
+        self._pitch_to_lane: dict[int, int] = {}
+        self._last_tick: int | None = None
+
+    def reset(self) -> None:
+        self._window.clear()
+        self._pitch_to_lane.clear()
+        self._last_tick = None
+
+    def _update_window(self, pitch: int) -> None:
+        self._window.append(pitch)
+        self._rebuild_cache()
+
+    def _rebuild_cache(self) -> None:
+        if not self._window:
+            self._pitch_to_lane.clear()
+            return
+        lo = min(self._window)
+        hi = max(self._window)
+        span = hi - lo
+        # Use at least _MIN_WINDOW_SPAN semitones so notes near each other
+        # still spread across lanes rather than collapsing to one.
+        effective_span = max(span, _MIN_WINDOW_SPAN)
+        # Defensive guard against division by zero: unreachable while
+        # _MIN_WINDOW_SPAN >= 1, but protects against future tuning changes.
+        if effective_span == 0:
+            self._pitch_to_lane = {p: 0 for p in set(self._window)}
+            return
+        new_cache: dict[int, int] = {}
+        for p in set(self._window):
+            new_cache[p] = round((p - lo) / effective_span * 4)
+        self._pitch_to_lane = new_cache
+
+    def lane(self, pitch: int, ir_tick: int) -> int:
+        """Return a lane (0-4) for pitch, updating the window."""
+        # Rest detection: long gap since last note resets the window.
+        if self._last_tick is not None and ir_tick - self._last_tick >= _REST_RESET_TICKS:
+            self.reset()
+        self._last_tick = ir_tick
+
+        # If the pitch is already in the window, recompute from the existing
+        # window (don't grow it again) to keep repeated notes stable.
+        if pitch in self._pitch_to_lane:
+            return self._pitch_to_lane[pitch]
+
+        # New pitch: add to window, rebuild.
+        self._update_window(pitch)
+        return self._pitch_to_lane.get(pitch, pitch % 5)
+
+
+def _assign_lanes_contour(
     group: list[dict[str, Any]],
     chug_string: int | None,
-    prev: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
+    contour: _ContourTracker,
+    ir_tick: int,
 ) -> list[int]:
-    """M3.2 lane assignment for one beat's notes (single or chord).
+    """Lane assignment for one beat's notes using contour tracking.
 
-    Chords are voiced by interval: lane gaps follow the actual
-    harmonic distance between successive notes (see
-    _interval_to_gap) rather than always being adjacent, so power
-    chords/5ths/octaves spread across skipped lanes (e.g. 0,2 or
-    1,3) instead of collapsing to 0,1.
-
-    Anti-repeat rule: if this chord's pitches differ from the
-    previous chord's but the naive anchoring would land on the exact
-    same lanes (root-mod collisions, e.g. C5 and Eb5 both anchoring
-    to base 0), nudge the base to the nearest free slot so the chart
-    visibly moves. Identical repeated chords (chugs) keep their lanes.
-    prev is (prev_pitches, prev_lanes) from the last chord.
+    Single notes: defer to the contour tracker.
+    Chords: use interval-spread voicing (inherited from M3) with the
+    contour tracker setting the root lane.
+    Open-string chug detection happens first and bypasses the contour.
     """
     if len(group) == 1:
         note = group[0]
         if note["fret"] == 0 and note["string"] == chug_string:
             return [OPEN_NOTE]
-        return [(note["pitch"] or 0) % 5]
+        pitch = note["pitch"] or 0
+        return [contour.lane(pitch, ir_tick)]
 
     pitches = sorted({n["pitch"] or 0 for n in group})
     width = min(len(pitches), 3)
     root = pitches[0]
+    root_lane = contour.lane(root, ir_tick)
 
     offsets = [0]
     for prev_p, curr_p in zip(pitches[: width - 1], pitches[1:width]):
@@ -158,11 +224,6 @@ def _assign_lanes(
 
     span = offsets[-1]
     if span > 4:
-        # Wider than the 5-lane neck: pin the outer notes to the full
-        # width and clamp the middle inside, instead of float scaling.
-        # (Unreachable with the current gap table — max span is 8 and
-        # no reachable combo collides — but explicit beats clever if
-        # _interval_to_gap ever changes.)
         if width == 2:
             offsets = [0, 4]
         else:
@@ -170,40 +231,32 @@ def _assign_lanes(
             offsets = [0, mid, 4]
         span = 4
 
-    n_bases = 4 - span + 1  # valid anchor positions on the neck
-    base = root % n_bases
+    # Anchor the chord at the root_lane, clamping to keep all lanes in 0-4.
+    base = max(0, min(4 - span, root_lane))
     lanes = sorted({base + o for o in offsets})
 
-    if prev is not None:
-        prev_pitches, prev_lanes = prev
-        if tuple(pitches) != prev_pitches and tuple(lanes) == prev_lanes:
-            if n_bases > 1:
-                # Different chord, identical lanes: shift to the nearest
-                # alternative anchor (prefer +1, wrap within range).
-                for delta in (1, -1, 2, -2, 3, -3, 4, -4):
-                    alt = base + delta
-                    if 0 <= alt < n_bases:
-                        lanes = sorted({alt + o for o in offsets})
-                        break
-            elif len(lanes) == 3:
-                # Full-width 3-note chord ([0, mid, 4]): the base can't
-                # move, so shift the middle note instead.
-                for alt_mid in (2, 1, 3):
-                    if alt_mid != lanes[1]:
-                        lanes = [0, alt_mid, 4]
-                        break
-            else:
-                # Full-width 2-note chord ([0, 4]): pull one end in a
-                # lane to distinguish it (still a wide skip shape).
-                lanes = [0, 3] if prev_lanes != (0, 3) else [1, 4]
+    # Update the contour window with additional chord pitches.
+    for p in pitches[1:width]:
+        contour.lane(p, ir_tick)
 
     return lanes
 
 
-def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
-    """Map a single track's (or blended) IR note list to chart notes."""
+def map_notes(
+    ir_notes: list[dict[str, Any]],
+    section_ticks: list[int] | None = None,
+) -> list[ChartNote]:
+    """Map a single track's (or blended) IR note list to chart notes.
+
+    section_ticks: optional sorted list of IR ticks where section markers
+    occur.  The contour window is reset at each boundary so lane choices
+    start fresh per section.
+    """
     notes = _merge_ties(ir_notes)
     chug_string = _lowest_tuning_string(notes)
+    section_set: set[int] = set(section_ticks or [])
+
+    contour = _ContourTracker()
 
     # Group simultaneous notes (chords share a tick; chord_id guards
     # against two tracks' blended notes colliding on one tick).
@@ -212,23 +265,21 @@ def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
         groups.setdefault((note["tick"], note.get("chord_id")), []).append(note)
 
     chart_notes: list[ChartNote] = []
-    prev_chord: tuple[tuple[int, ...], tuple[int, ...]] | None = None
-    for (tick, _), group in sorted(groups.items(), key=lambda kv: kv[0][0]):
-        lanes = _assign_lanes(group, chug_string, prev=prev_chord)
-        if len(group) > 1 and lanes != [OPEN_NOTE]:
-            prev_chord = (
-                tuple(sorted({n["pitch"] or 0 for n in group})),
-                tuple(lanes),
-            )
+    for (ir_tick, _), group in sorted(groups.items(), key=lambda kv: kv[0][0]):
+        # Reset contour at explicit section boundaries.
+        if ir_tick in section_set:
+            contour.reset()
+
+        lanes = _assign_lanes_contour(group, chug_string, contour, ir_tick)
         duration = max(n["duration_ticks"] for n in group)
         chart_notes.append(
             ChartNote(
-                tick=_to_chart_ticks(tick),
+                tick=_to_chart_ticks(ir_tick),
                 lanes=sorted(set(lanes)),
                 sustain=_to_chart_ticks(duration),
                 forced=any(n.get("hammer_on") or n.get("pull_off") for n in group),
                 tap=any(n.get("tap") for n in group),
-                source={"ir_tick": tick},
+                source={"ir_tick": ir_tick},
             )
         )
 

@@ -13,6 +13,7 @@ shred2chart = "shred2chart.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "argcomplete>=3.0",
 ]
 
 [build-system]

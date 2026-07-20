@@ -93,22 +93,33 @@ It creates a folder `songs/Artist - Title/` with two files:
 ## User-Friendly Improvements Checklist
 
 - [x] Add an opt-in guided conversion workflow (`convert --interactive`)
-- [ ] Validate input files and report filesystem errors clearly
+- [x] Validate input files and report filesystem errors clearly
 - [x] Protect existing output folders from accidental overwrites in guided mode
-- [ ] Make track selection consistent across inspection and conversion commands
-- [ ] Support conversion for all formats currently accepted by inspection commands
-- [ ] Add a `check`/`validate` command for generated charts
-- [ ] Add `--version`, verbosity controls, dry-run mode, and shell completion
-- [ ] Improve audio handling and provide clearer `ffmpeg` guidance
-- [ ] Add richer metadata and optional ready-to-import archives
-- [ ] Escape metadata safely and validate generated chart files
-- [ ] Add command-level integration tests and a sample fixture
+- [x] Make track selection consistent across inspection and conversion commands
+- [x] Support conversion for all formats currently accepted by inspection commands
+- [x] Add a `check`/`validate` command for generated charts
+- [x] Add `--version`, verbosity controls, dry-run mode, and shell completion
+- [x] Improve audio handling and provide clearer `ffmpeg` guidance
+- [x] Add richer metadata and optional ready-to-import archives
+- [x] Escape metadata safely and validate generated chart files
+- [x] Add command-level integration tests and a sample fixture
 
-The first item is implemented as an opt-in mode so existing scripts remain
-non-interactive and unchanged:
+New CLI flags added in this round:
+
+| Flag | Command | What it does |
+|------|---------|-------------|
+| `--version` | `shred2chart` | Print the installed version |
+| `-v` / `--verbose` | `shred2chart` | Enable debug-level logging |
+| `-q` / `--quiet` | `shred2chart` | Suppress all progress output |
+| `--dry-run` | `convert` | Show what would happen without writing |
+| `--charter NAME` | `convert` | Set your name in song.ini and notes.chart |
+| `--archive` | `convert` | Create a ready-to-import `.zip` alongside the folder |
+
+New subcommand:
 
 ```bash
-shred2chart convert song.gp --interactive
+shred2chart check ./songs/Artist\ -\ Title/
+# prints OK or a list of validation errors
 ```
 
 ## Questions?

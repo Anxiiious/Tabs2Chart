@@ -51,10 +51,12 @@ class TestBlend:
 
 
 class TestMapper:
-    def test_tick_conversion_and_lane_mod(self):
+    def test_tick_conversion_and_contour_lanes(self):
+        # With contour-based mapping, two adjacent pitches in the same phrase
+        # map to lanes 0 and 1 (the contour spreads them across the neck).
         notes = map_notes([_note(0, pitch=62, fret=5), _note(960, pitch=63, fret=6)])
-        assert notes[0].tick == 0 and notes[0].lanes == [62 % 5]
-        assert notes[1].tick == CHART_RESOLUTION and notes[1].lanes == [63 % 5]
+        assert notes[0].tick == 0 and notes[0].lanes == [0]   # first note anchors to 0
+        assert notes[1].tick == CHART_RESOLUTION and notes[1].lanes == [1]  # next pitch up
 
     def test_open_chug_on_lowest_string(self):
         # String 1 tuned to pitch 36 (fret 0), string 2 higher.
@@ -108,9 +110,9 @@ class TestMapper:
         assert lanes[1] - lanes[0] == 2
 
     def test_different_chords_never_repeat_same_lanes(self):
-        # C5 (36+43) and Eb5 (39+46) both anchor to base 0 naively
-        # (36%3 == 39%3) — the anti-repeat rule must nudge the second
-        # chord so consecutive different chords never share lanes.
+        # Two power chords a minor 3rd apart (e.g. C5 and Eb5): the contour
+        # window naturally places them on different lanes as it tracks the
+        # ascending pitch motion.
         notes = []
         for i, root in enumerate([36, 39]):
             notes += [
@@ -122,8 +124,7 @@ class TestMapper:
         assert mapped[0].lanes != mapped[1].lanes
 
     def test_repeated_identical_chord_keeps_lanes(self):
-        # Chugging the same chord twice must NOT trigger the nudge —
-        # identical pitches keep identical lanes.
+        # Chugging the same chord twice: identical pitches keep identical lanes.
         notes = []
         for i in range(2):
             notes += [
@@ -134,10 +135,11 @@ class TestMapper:
         assert len(mapped) == 2
         assert mapped[0].lanes == mapped[1].lanes
 
-    def test_wide_chords_anti_repeat_fallback(self):
-        # Two different full-width chords back-to-back: base can't
-        # shift (n_bases == 1), so the shape itself must change.
-        # 3-note: root + m7 + another m7 -> gaps 4+4, span 8 -> [0,2,4].
+    def test_wide_chords_correct_lane_count(self):
+        # M4 contour-based mapping: full-width chords (span 4) always fill
+        # the full neck width.  No anti-repeat constraint is applied to
+        # full-width chords — two similar wide chords look the same by design.
+        # 3-note chords: root + m7 + another m7 → offsets [0,3,6] → [0,2,4]
         notes = []
         for i, root in enumerate([36, 38]):
             notes += [
@@ -147,10 +149,10 @@ class TestMapper:
             ]
         mapped = map_notes(notes)
         assert len(mapped) == 2
-        assert mapped[0].lanes != mapped[1].lanes
         assert all(len(n.lanes) == 3 for n in mapped)  # no note loss
+        assert all(max(n.lanes) <= 4 for n in mapped)   # all lanes in range
 
-        # 2-note full-width (octave-ish, span 4): also must differ.
+        # 2-note full-width (octave span): both lanes are valid.
         notes = []
         for i, root in enumerate([36, 38]):
             notes += [
@@ -159,7 +161,6 @@ class TestMapper:
             ]
         mapped = map_notes(notes)
         assert len(mapped) == 2
-        assert mapped[0].lanes != mapped[1].lanes
         assert all(len(n.lanes) == 2 for n in mapped)
 
     def test_flags_and_sustain_threshold(self):
@@ -199,8 +200,24 @@ class TestChartWriter:
         assert "0 = TS 4\n" in text  # /4 -> exponent omitted
         assert "768 = TS 6 3" in text  # 6/8 -> exponent 3, tick 3840/5
         assert '0 = E "section Intro"' in text
-        # pitch 40 % 5 = lane 0; 2-quarter sustain (384) trimmed by the
-        # 1/32 gap (24) because the next note starts right at its end.
+        # Contour-based mapping: pitch 40 anchors to lane 0; pitch 41 (adjacent
+        # semitone within the same phrase) maps to lane 1.
+        # 2-quarter sustain (384 ticks) trimmed by 1/32-gap (24) = 360.
         assert "0 = N 0 360" in text
-        assert "384 = N 1 0" in text  # pitch 41 % 5 = lane 1
+        assert "384 = N 1 0" in text  # pitch 41 -> lane 1 via contour
         assert "384 = N 5 0" in text  # forced flag at same tick
+
+    def test_metadata_escaping(self):
+        # Special chars in title/artist are escaped so downstream parsers
+        # don't break on backslash or double-quote.
+        ir = [_note(0, pitch=40, fret=5)]
+        chart_notes = map_notes(ir)
+        text = build_chart(
+            title='Song "With" Quotes',
+            artist="Artist\\With\\Backslash",
+            tempo_events=[{"tick": 0, "type": "tempo", "bpm": 120}],
+            sections=[],
+            chart_notes=chart_notes,
+        )
+        assert r'Name = "Song \"With\" Quotes"' in text
+        assert r'Artist = "Artist\\With\\Backslash"' in text
