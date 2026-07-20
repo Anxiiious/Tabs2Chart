@@ -143,13 +143,22 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     artist = (root.findtext("./Score/Artist") or "Unknown Artist").strip() or "Unknown Artist"
 
     tracks = ir_gpif.list_tracks(xml_text)
-    if args.tracks:
+    names = dict(tracks)
+    known = {t for t, _ in tracks}
+
+    if args.track is not None:
+        if args.track not in known:
+            print(f"error: track {args.track} not in this file. Available:", file=sys.stderr)
+            for track_id, name in tracks:
+                print(f"  {track_id}: {name}", file=sys.stderr)
+            return 1
+        track_ids = [args.track]
+    elif args.tracks:
         try:
             track_ids = [int(t) for t in args.tracks.split(",")]
         except ValueError:
             print(f"error: --tracks must be comma-separated numbers, got {args.tracks!r}", file=sys.stderr)
             return 1
-        known = {t for t, _ in tracks}
         unknown = [t for t in track_ids if t not in known]
         if unknown:
             print(f"error: track(s) {unknown} not in this file. Available:", file=sys.stderr)
@@ -159,30 +168,39 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     else:
         track_ids = _guess_guitar_tracks(tracks)
 
-    names = dict(tracks)
     print(f"{title} - {artist}")
-    print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
     tempo_events = gpif_tempo.dump_tempo_events(xml_text)
     sections = gpif_tempo.dump_sections(xml_text)
 
-    # Blend at section granularity; if the file has no section markers,
-    # fall back to fixed 8-bar windows so blending still happens at a
-    # phrase-ish scale instead of collapsing to one whole-song pick.
-    blend_spans = sections
-    if not blend_spans and len(track_ids) > 1:
-        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
-        blend_spans = [
-            {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
-            for i in range(0, len(bar_starts), 8)
-        ]
-        print("(no section markers in file - blending in 8-bar windows instead)")
+    if args.track is not None:
+        # Single-track mode: chart it verbatim, no blending/section-switching -
+        # for when auto-blending multiple tracks produces a jumbled chart.
+        print(f"charting track {args.track} ({names[args.track]}) only, no blending")
+        blended = ir_gpif.dump_ir(xml_text, track_index=args.track)
+        choices = []
+    else:
+        print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
-    tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
-    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+        # Blend at section granularity; if the file has no section markers,
+        # fall back to fixed 8-bar windows so blending still happens at a
+        # phrase-ish scale instead of collapsing to one whole-song pick.
+        blend_spans = sections
+        if not blend_spans and len(track_ids) > 1:
+            bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+            blend_spans = [
+                {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
+                for i in range(0, len(bar_starts), 8)
+            ]
+            print("(no section markers in file - blending in 8-bar windows instead)")
+
+        tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
+        blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+
     chart_notes = mapper.map_notes(blended)
 
-    print(f"\n{len(sections)} section(s), {len(blended)} notes after blending, "
+    print(f"\n{len(sections)} section(s), {len(blended)} notes"
+          f"{'' if args.track is not None else ' after blending'}, "
           f"{len(chart_notes)} chart events:")
     for choice in choices:
         print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
@@ -359,10 +377,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="convert a .gp/.gpx file into a Clone Hero song folder (notes.chart + song.ini)",
     )
     p_convert.add_argument("gp_file", help="path to a .gp (GP7/8) or .gpx (GP6) file")
-    p_convert.add_argument(
+    p_track_group = p_convert.add_mutually_exclusive_group()
+    p_track_group.add_argument(
         "--tracks",
         help="comma-separated track numbers to blend, in priority order (see `list-tracks`); "
         "default: every guitar-named track, blended per section",
+    )
+    p_track_group.add_argument(
+        "--track", type=int,
+        help="chart exactly this one track, verbatim - no blending/section-switching logic "
+        "at all (see `list-tracks` for the index). Use this if auto-blending multiple "
+        "tracks produces a jumbled chart.",
     )
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
