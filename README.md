@@ -57,6 +57,14 @@ Commands so far, run as `shred2chart <command>`:
 `convert` is the one that makes something playable; the rest are inspection tools that show you
 (and your coding agent) what's inside a file.
 
+For a guided first conversion, add `--interactive`. It shows the detected tracks, lets you adjust
+the tracks and output folder, warns before writing into a non-empty folder, and reminds you that
+the generated folder expects an audio file named `song.ogg`:
+
+```bash
+shred2chart convert your_song.gp --interactive
+```
+
 ## 4. Your next concrete step
 
 **If your tab is a `.gp` file** (modern Guitar Pro 7/8 — this turned out to be what real Sheet

@@ -90,6 +90,27 @@ It creates a folder `songs/Artist - Title/` with two files:
 5. Test in Clone Hero or Moonscraper
 6. If it doesn't sync right, use `--offset-ms` to adjust
 
+## User-Friendly Improvements Checklist
+
+- [x] Add an opt-in guided conversion workflow (`convert --interactive`)
+- [ ] Validate input files and report filesystem errors clearly
+- [ ] Protect existing output folders from accidental overwrites
+- [ ] Make track selection consistent across inspection and conversion commands
+- [ ] Support conversion for all formats currently accepted by inspection commands
+- [ ] Add a `check`/`validate` command for generated charts
+- [ ] Add `--version`, verbosity controls, dry-run mode, and shell completion
+- [ ] Improve audio handling and provide clearer `ffmpeg` guidance
+- [ ] Add richer metadata and optional ready-to-import archives
+- [ ] Escape metadata safely and validate generated chart files
+- [ ] Add command-level integration tests and a sample fixture
+
+The first item is implemented as an opt-in mode so existing scripts remain
+non-interactive and unchanged:
+
+```bash
+shred2chart convert song.gp --interactive
+```
+
 ## Questions?
 
 - For how-tos: see `README.md`

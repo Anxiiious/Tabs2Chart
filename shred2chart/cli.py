@@ -122,6 +122,50 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
+def _prompt_convert_options(
+    args: argparse.Namespace,
+    tracks: list[tuple[int, str]],
+    track_ids: list[int],
+    names: dict[int, str],
+) -> tuple[list[int], Path] | None:
+    """Let an interactive user review track and output choices before writing."""
+    print("\nInteractive conversion")
+    print("Available tracks:")
+    for track_id, name in tracks:
+        marker = "*" if track_id in track_ids else " "
+        print(f"  {marker} {track_id}: {name}")
+
+    default_tracks = ",".join(str(track_id) for track_id in track_ids)
+    while True:
+        selected = input(f"Tracks to blend [{default_tracks}]: ").strip() or default_tracks
+        try:
+            selected_ids = [int(track_id.strip()) for track_id in selected.split(",")]
+        except ValueError:
+            print("Please enter comma-separated track numbers.")
+            continue
+        unknown = [track_id for track_id in selected_ids if track_id not in names]
+        if unknown:
+            print(f"Unknown track(s): {', '.join(map(str, unknown))}")
+            continue
+        if not selected_ids:
+            print("Select at least one track.")
+            continue
+        break
+
+    default_out = Path(args.out) if args.out else Path(f"songs/{args.artist} - {args.title}")
+    out_text = input(f"Output folder [{default_out}]: ").strip()
+    out_dir = Path(out_text).expanduser() if out_text else default_out
+    if out_dir.exists() and any(out_dir.iterdir()):
+        answer = input(f"{out_dir} is not empty. Overwrite its files? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled; no files were written.")
+            return None
+
+    print("The chart will use song.ogg in the output folder.")
+    print("Use --offset-ms if the chart needs audio-sync adjustment later.")
+    return selected_ids, out_dir
+
+
 def _cmd_convert(args: argparse.Namespace) -> int:
     path = Path(args.gp_file)
     if path.suffix.lower() not in _CONTAINER_SUFFIXES:
@@ -160,6 +204,15 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         track_ids = _guess_guitar_tracks(tracks)
 
     names = dict(tracks)
+    if args.interactive:
+        args.artist = artist
+        args.title = title
+        interactive_options = _prompt_convert_options(args, tracks, track_ids, names)
+        if interactive_options is None:
+            return 0
+        track_ids, interactive_out = interactive_options
+    else:
+        interactive_out = None
     print(f"{title} - {artist}")
     print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
@@ -187,7 +240,11 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     for choice in choices:
         print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
-    out_dir = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    out_dir = (
+        interactive_out
+        if interactive_out is not None
+        else Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    )
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
     )
@@ -327,6 +384,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
         help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+    )
+    p_convert.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="review tracks and output folder interactively before writing",
     )
     p_convert.set_defaults(func=_cmd_convert)
 
