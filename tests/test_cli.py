@@ -26,7 +26,7 @@ def test_interactive_prompt_allows_track_and_output_selection(monkeypatch, tmp_p
     assert result == ([1, 0], tmp_path / "output")
 
 
-def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_path):
+def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_path, capsys):
     answers = iter(["bad", "9", "", str(tmp_path / "output")])
     prompts = []
 
@@ -48,6 +48,9 @@ def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_pat
 
     assert result == ([1, 0], tmp_path / "output")
     assert len(prompts) == 4
+    output = capsys.readouterr().out
+    assert "Please enter comma-separated track numbers." in output
+    assert "Unknown track(s): 9" in output
 
 
 def test_interactive_prompt_can_cancel_overwrite(monkeypatch, tmp_path):

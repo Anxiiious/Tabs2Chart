@@ -155,6 +155,7 @@ def _prompt_convert_options(
             continue
         break
 
+    print("Provide an audio file named song.ogg in the output folder before playing.")
     default_out = Path(args.out) if args.out else _default_output_dir(artist, title)
     out_text = input(f"Output folder [{default_out}]: ").strip()
     out_dir = Path(out_text).expanduser() if out_text else default_out
@@ -164,7 +165,6 @@ def _prompt_convert_options(
             print("Cancelled; no files were written.")
             return None
 
-    print("Provide an audio file named song.ogg in the output folder before playing.")
     print("Use --offset-ms if the chart needs audio-sync adjustment later.")
     return selected_ids, out_dir
 
