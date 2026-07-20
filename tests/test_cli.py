@@ -9,7 +9,7 @@ def test_convert_parser_supports_interactive_mode():
     assert args.interactive is True
 
 
-def test_interactive_prompt_allows_track_and_output_selection(monkeypatch, tmp_path):
+def test_interactive_prompt_allows_custom_track_order_and_output_selection(monkeypatch, tmp_path):
     answers = iter(["1,0", str(tmp_path / "output")])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
     args = Namespace(out=None)
