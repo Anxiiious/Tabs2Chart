@@ -8,6 +8,7 @@ from shred2chart.mapper import (
     IR_TICKS_PER_QUARTER,
     ChartNote,
     _chord_lanes_sequence,
+    _group_chords_into_hand_positions,
     _group_into_hand_positions,
     _single_note_lanes,
     map_notes,
@@ -244,16 +245,52 @@ class TestChordDisjoint:
         lanes_seq = _chord_lanes_sequence([(54, 66), (57, 69), (54, 66)])
         assert lanes_seq[0] == lanes_seq[2]
 
-    def test_small_root_shift_does_not_jump_the_whole_lane_range(self):
-        # Regression guard for a real bug found by playtest: the old
-        # absolute-pitch chord formula (root % N) jumped the FULL lane
-        # range for a small root shift - confirmed on "Still Searching"
-        # track 1, (59,71)->(56,68), a 3-semitone (minor 3rd) root
-        # movement that jumped [3,4]->[0,1]. The new anchor/leap design
-        # (same mechanism as single notes) should keep a small shift's
-        # lane movement small.
-        lanes_seq = _chord_lanes_sequence([(59, 71), (56, 68)])
-        assert abs(lanes_seq[1][0] - lanes_seq[0][0]) <= 2
+    def test_real_section_f_regression_nearby_chords_spread_across_lanes(self):
+        # Regression guard for a real bug found by playtest: an earlier
+        # per-chord leap+memo design (root-to-root leaps, analogous to a
+        # v1-era single-note contour) crowded several nearby-but-distinct
+        # power-chord shapes onto lanes 3-4 - "Section F feels anchored
+        # at blue and orange during most of the chord changes." Real data:
+        # "Still Searching" track 1 section [F], 5 power-chord roots
+        # (56/57/59/61/62, all root+octave voicings) spanning 6
+        # semitones - one hand position. Rank-ordering the group's
+        # distinct roots (same mechanism as the single-note section [D]
+        # fix) must spread them across most of the lane range instead of
+        # crowding into 1-2 lanes.
+        chords = [
+            (57, 69), (56, 68), (59, 71), (57, 69), (56, 68), (59, 71),
+            (61, 73), (59, 71), (62, 74), (61, 73), (59, 71),
+        ]
+        lanes_seq = _chord_lanes_sequence(chords)
+        base_lanes = [lanes[0] for lanes in lanes_seq]
+        assert len(set(base_lanes)) >= 4, f"squashed to {sorted(set(base_lanes))}: {base_lanes}"
+
+    def test_gradual_chord_walk_stays_one_group_despite_wide_total_span(self):
+        # Regression guard: chord grouping uses a ROLLING anchor (compare
+        # each chord's root to the PREVIOUS chord's root), not a fixed
+        # first-root anchor. A gradual walk where every step is small but
+        # the first-to-last span exceeds HAND_POSITION_SEMITONES must
+        # still stay ONE group - confirmed necessary on the real section
+        # [F] progression (roots 56-57-59-61-62, each step <=4 semitones,
+        # first-to-last span is 6). A fixed-first-root anchor split this
+        # partway through, which meant the rank-order-across-the-group
+        # fix only ever saw half the progression's roots and still
+        # crowded distinct chords onto the same 1-2 lanes.
+        chords = [(56, 68), (57, 69), (59, 71), (61, 73), (62, 74)]
+        groups = _group_chords_into_hand_positions(chords)
+        assert len(groups) == 1
+
+    def test_repeated_chord_in_a_fast_progression_reuses_its_own_lane(self):
+        # Companion to the section [F] spread test: within that same
+        # cluster, each DISTINCT chord shape must still map consistently
+        # to its own lane every time it recurs (not just "spread out
+        # overall") - repeat-stability within the group, not just across
+        # groups.
+        chords = [(57, 69), (56, 68), (59, 71), (57, 69), (56, 68), (59, 71)]
+        lanes_seq = _chord_lanes_sequence(chords)
+        assert lanes_seq[0] == lanes_seq[3]  # (57,69) both times
+        assert lanes_seq[1] == lanes_seq[4]  # (56,68) both times
+        assert lanes_seq[2] == lanes_seq[5]  # (59,71) both times
 
 
 class TestChartWriter:
