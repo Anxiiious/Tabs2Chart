@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .mapper import FORCED_FLAG, TAP_FLAG, CHART_RESOLUTION, ChartNote, _to_chart_ticks
+from .validation import escape_metadata
 
 
 def _sync_track_lines(tempo_events: list[dict[str, Any]]) -> list[str]:
@@ -56,6 +57,44 @@ def _note_lines(chart_notes: list[ChartNote]) -> list[str]:
     return lines
 
 
+def compute_song_length_ms(
+    chart_notes: list[ChartNote],
+    tempo_events: list[dict[str, Any]],
+) -> int:
+    """Estimate song length in milliseconds from the last chart note.
+
+    Converts the last note's chart tick back to wall-clock time using the
+    tempo map.  Returns 0 if there are no notes or no tempo information.
+    """
+    if not chart_notes or not tempo_events:
+        return 0
+
+    last_tick = max(n.tick + n.sustain for n in chart_notes)
+
+    # Rebuild a simple tick->ms map from the tempo events (chart resolution).
+    tempos = sorted(
+        (e for e in tempo_events if e["type"] == "tempo"),
+        key=lambda e: e["tick"],
+    )
+    if not tempos:
+        return 0
+
+    # Convert IR ticks to chart ticks for the tempo event positions.
+    from .mapper import _to_chart_ticks as _tc  # noqa: PLC0415 (local import ok here)
+
+    ms = 0.0
+    for i, ev in enumerate(tempos):
+        start_tick = _tc(ev["tick"])
+        end_tick = _tc(tempos[i + 1]["tick"]) if i + 1 < len(tempos) else last_tick
+        if start_tick >= last_tick:
+            break
+        span = min(end_tick, last_tick) - start_tick
+        ms_per_tick = 60_000.0 / (ev["bpm"] * CHART_RESOLUTION)
+        ms += span * ms_per_tick
+
+    return round(ms)
+
+
 def build_chart(
     title: str,
     artist: str,
@@ -63,15 +102,19 @@ def build_chart(
     sections: list[dict[str, Any]],
     chart_notes: list[ChartNote],
     offset_ms: int = 0,
+    charter: str = "shred2chart",
 ) -> str:
     def block(name: str, lines: list[str]) -> str:
         body = "\n".join(lines)
         return f"[{name}]\n{{\n{body}\n}}\n"
 
+    safe_title = escape_metadata(title)
+    safe_artist = escape_metadata(artist)
+    safe_charter = escape_metadata(charter)
     song_lines = [
-        f'  Name = "{title}"',
-        f'  Artist = "{artist}"',
-        '  Charter = "shred2chart"',
+        f'  Name = "{safe_title}"',
+        f'  Artist = "{safe_artist}"',
+        f'  Charter = "{safe_charter}"',
         f"  Offset = {offset_ms / 1000}",
         f"  Resolution = {CHART_RESOLUTION}",
         '  MusicStream = "song.ogg"',
@@ -85,15 +128,27 @@ def build_chart(
     return "\n".join(parts)
 
 
-def build_song_ini(title: str, artist: str, offset_ms: int = 0) -> str:
-    return (
-        "[song]\n"
-        f"name = {title}\n"
-        f"artist = {artist}\n"
-        "charter = shred2chart\n"
-        f"delay = {offset_ms}\n"
-        "diff_guitar = -1\n"
-    )
+def build_song_ini(
+    title: str,
+    artist: str,
+    offset_ms: int = 0,
+    charter: str = "shred2chart",
+    song_length_ms: int = 0,
+) -> str:
+    safe_title = escape_metadata(title)
+    safe_artist = escape_metadata(artist)
+    safe_charter = escape_metadata(charter)
+    lines = [
+        "[song]",
+        f"name = {safe_title}",
+        f"artist = {safe_artist}",
+        f"charter = {safe_charter}",
+        f"delay = {offset_ms}",
+        "diff_guitar = -1",
+    ]
+    if song_length_ms > 0:
+        lines.append(f"song_length = {song_length_ms}")
+    return "\n".join(lines) + "\n"
 
 
 def write_song_folder(
@@ -104,10 +159,15 @@ def write_song_folder(
     sections: list[dict[str, Any]],
     chart_notes: list[ChartNote],
     offset_ms: int = 0,
+    charter: str = "shred2chart",
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    chart_text = build_chart(title, artist, tempo_events, sections, chart_notes, offset_ms)
+    chart_text = build_chart(title, artist, tempo_events, sections, chart_notes, offset_ms, charter)
+    song_length_ms = compute_song_length_ms(chart_notes, tempo_events)
     (out_path / "notes.chart").write_text(chart_text, encoding="utf-8")
-    (out_path / "song.ini").write_text(build_song_ini(title, artist, offset_ms), encoding="utf-8")
+    (out_path / "song.ini").write_text(
+        build_song_ini(title, artist, offset_ms, charter, song_length_ms),
+        encoding="utf-8",
+    )
     return out_path

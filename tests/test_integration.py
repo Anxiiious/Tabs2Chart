@@ -78,7 +78,10 @@ def test_prepare_audio_uses_ffmpeg_for_other_formats(tmp_path, monkeypatch):
 def test_song_folder_validation_catches_missing_audio(tmp_path):
     out = tmp_path / "song"
     out.mkdir()
-    (out / "notes.chart").write_text("[Song]\n{\n}\n")
+    # Include [ExpertSingle] with at least one note so the only failure is the missing audio.
+    (out / "notes.chart").write_text(
+        "[Song]\n{\n}\n\n[ExpertSingle]\n{\n  0 = N 0 0\n}\n", encoding="utf-8"
+    )
     (out / "song.ini").write_text(
         "[song]\nname = Title\nartist = Artist\n", encoding="utf-8"
     )
