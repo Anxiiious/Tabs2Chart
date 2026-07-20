@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -129,7 +130,8 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
 
 def _safe_path_part(value: str) -> str:
     """Keep metadata-derived output paths within the songs directory."""
-    cleaned = value.replace("/", "_").replace("\\", "_").strip(" .")
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "_", value)
+    cleaned = cleaned.replace("/", "_").replace("\\", "_").replace(":", "_").strip(" .")
     return cleaned or "Untitled"
 
 

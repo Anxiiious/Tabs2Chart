@@ -69,7 +69,10 @@ def test_prepare_audio_uses_ffmpeg_for_other_formats(tmp_path, monkeypatch):
     target = _prepare_audio(source, out)
 
     assert target.is_file()
-    assert calls[0][0][-2:] == ["libvorbis", str(out / "song.ogg")]
+    command = calls[0][0]
+    assert command[0] == "/usr/bin/ffmpeg"
+    assert command[command.index("-acodec") + 1] == "libvorbis"
+    assert command[-1] == str(out / "song.ogg")
 
 
 def test_song_folder_validation_catches_missing_audio(tmp_path):

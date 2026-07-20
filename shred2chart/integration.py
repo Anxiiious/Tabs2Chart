@@ -79,5 +79,6 @@ def invoke_moon_scraper(
     }
     if completed.returncode:
         detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic output"
+        detail = " ".join(detail.split())[:1000]
         raise RuntimeError(f"command exited with {completed.returncode}: {detail}")
     return result
