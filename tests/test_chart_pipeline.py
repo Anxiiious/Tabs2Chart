@@ -17,6 +17,14 @@ from shred2chart.mapper import (
 IR_QUARTER = 960  # IR ticks per quarter note
 
 
+def _pf(pitches):
+    """(pitch, fret) pairs for grouping/lane tests that don't care about
+    string - fret stands in for pitch (a single-string melody has
+    fret == pitch - open-string offset, so using pitch itself as the
+    fret keeps these synthetic examples' hand-position math unchanged)."""
+    return [(p, p) for p in pitches]
+
+
 def _note(tick, pitch=40, string=1, fret=0, duration=IR_QUARTER // 4, **flags):
     base = {
         "tick": tick, "duration_ticks": duration, "pitch": pitch, "string": string,
@@ -118,21 +126,31 @@ class TestMapper:
 
 
 class TestHandPositionGrouping:
-    """_group_into_hand_positions: splits a pitch sequence into runs where
-    every note stays within HAND_POSITION_SEMITONES of the run's first
-    pitch (see mapper.py module docstring)."""
+    """_group_into_hand_positions: splits a (pitch, fret) note sequence
+    into runs where every note stays within HAND_POSITION_SEMITONES of
+    the PREVIOUS note's fret (see mapper.py module docstring)."""
 
     def test_notes_within_one_hand_position_form_one_group(self):
-        assert _group_into_hand_positions([60, 62, 64]) == [[60, 62, 64]]
+        assert _group_into_hand_positions(_pf([60, 62, 64])) == [_pf([60, 62, 64])]
 
     def test_leap_beyond_hand_position_starts_a_new_group(self):
-        assert _group_into_hand_positions([60, 72]) == [[60], [72]]
+        assert _group_into_hand_positions(_pf([60, 72])) == [_pf([60]), _pf([72])]
 
     def test_boundary_delta_of_exactly_four_stays_in_one_group(self):
-        assert _group_into_hand_positions([60, 64]) == [[60, 64]]
+        assert _group_into_hand_positions(_pf([60, 64])) == [_pf([60, 64])]
 
     def test_empty_input_returns_no_groups(self):
         assert _group_into_hand_positions([]) == []
+
+    def test_groups_by_fret_not_pitch(self):
+        # The actual bug fix: a low pedal tone on a different string
+        # (big pitch delta, small fret delta) must NOT force a new hand
+        # position - confirmed on a real lead lick ("Still Searching"
+        # track 1 ticks 92000-110880): pitch 61 (string 3, fret 11)
+        # alternates against notes on strings 4-6 whose pitches are
+        # 7-17 semitones away but whose frets stay within a 6-fret span.
+        notes = [(61, 11), (73, 14), (61, 11), (69, 14)]
+        assert _group_into_hand_positions(notes) == [notes]
 
 
 class TestSingleNoteLanes:
@@ -142,23 +160,23 @@ class TestSingleNoteLanes:
     anchor contour)."""
 
     def test_first_group_seeds_centered(self):
-        lanes = _single_note_lanes([60])
+        lanes = _single_note_lanes(_pf([60]))
         assert lanes == [2]
 
     def test_distinct_pitches_in_one_group_get_distinct_rank_ordered_lanes(self):
         # Ascending pitches within one hand position rank in the same
         # order: lowest pitch gets the lowest lane of the spread.
-        lanes = _single_note_lanes([60, 62, 64])
+        lanes = _single_note_lanes(_pf([60, 62, 64]))
         assert lanes[0] < lanes[1] < lanes[2]
         assert len(set(lanes)) == 3
 
     def test_repeated_pitch_within_a_group_reuses_its_rank_lane(self):
-        lanes = _single_note_lanes([60, 62, 60, 62])
+        lanes = _single_note_lanes(_pf([60, 62, 60, 62]))
         assert lanes[0] == lanes[2]
         assert lanes[1] == lanes[3]
 
     def test_leap_starts_a_new_group_centered_by_default(self):
-        lanes = _single_note_lanes([60, 72])
+        lanes = _single_note_lanes(_pf([60, 72]))
         assert lanes[0] == 2  # first group, centered
         # second group is a fresh single-pitch group; its target lane is
         # a proportional leap (round(12/3)=4) from the centered anchor,
@@ -176,7 +194,7 @@ class TestSingleNoteLanes:
         riff = [60, 62, 64]
         unrelated = [90, 91]  # a distant, unrelated passage in between
         pitches = riff + unrelated + riff
-        lanes = _single_note_lanes(pitches)
+        lanes = _single_note_lanes(_pf(pitches))
         assert lanes[0:3] == lanes[-3:]
 
     def test_consecutive_distinct_pitches_never_share_a_lane(self):
@@ -189,7 +207,7 @@ class TestSingleNoteLanes:
         # formula. Neither is HOPO-specific - the rule is general: no two
         # ADJACENT single notes with different pitches may share a lane.
         pitches = [52, 50, 49, 50, 49, 47]
-        lanes = _single_note_lanes(pitches)
+        lanes = _single_note_lanes(_pf(pitches))
         for i in range(1, len(pitches)):
             assert lanes[i] != lanes[i - 1], (
                 f"note {i} (pitch {pitches[i]}) repeated lane {lanes[i]} "
@@ -197,17 +215,44 @@ class TestSingleNoteLanes:
             )
 
     def test_real_lead_lick_regression_spreads_across_lanes(self):
-        # Regression guard for the M4 v1 "stuck high" bug: a real wide-
-        # ranging lead lick (Still Searching, track 1, ticks 92000-110880,
-        # spanning 17 semitones) got jammed onto just 2 adjacent lanes
-        # under v1's flat +-1 step.
-        pitches = [
-            68, 61, 73, 61, 69, 69, 61, 68, 66, 66, 61, 76, 78, 78, 76, 73, 61, 73,
-            61, 69, 69, 61, 68, 66, 66, 73, 74, 76, 76, 74, 73, 69, 61, 73, 61, 69,
-            69, 61, 68, 66,
+        # Regression guard for the M4 v1 "stuck high" bug, later found to
+        # still be broken under v6/v7: a real wide-ranging lead lick
+        # ("Still Searching" track 1, ticks 92000-110880) alternates a
+        # low pedal tone (pitch 61, string 3, fret 11) against a moving
+        # voice on strings 4-6 (frets 9-15) - pitch deltas up to 17
+        # semitones, but the whole phrase sits in a 6-fret span. Grouping
+        # by pitch (rather than fret) fragmented this into ~20 one/two-
+        # note groups, each leaping independently from a reset center
+        # lane, so several distinct high notes collapsed onto the same
+        # clamped lane - the phrase read as only two buttons repeating
+        # despite touching 8 distinct pitches. Grouping by fret keeps it
+        # one hand position, so the whole phrase's distinct pitches
+        # rank-order together across up to 5 lanes.
+        notes = [
+            (68, 9), (61, 11), (73, 14), (61, 11), (69, 14), (69, 14), (61, 11),
+            (68, 13), (66, 11), (66, 11), (61, 11), (76, 12), (78, 14), (78, 14),
+            (76, 12), (73, 14), (61, 11), (73, 14), (61, 11), (69, 14), (69, 14),
+            (61, 11), (68, 13), (66, 11), (66, 11), (73, 14), (74, 15), (76, 12),
+            (76, 12), (74, 15), (73, 14), (69, 14), (61, 11), (73, 14), (61, 11),
+            (69, 14), (69, 14), (61, 11), (68, 13), (66, 11),
         ]
-        lanes = _single_note_lanes(pitches)
-        assert len(set(lanes)) >= 3, f"squashed to {sorted(set(lanes))}: {lanes}"
+        lanes = _single_note_lanes(notes)
+        assert len(set(lanes)) >= 4, f"squashed to {sorted(set(lanes))}: {lanes}"
+
+        # Grouping now keeps the whole phrase in a handful of wide
+        # hand-position groups (split only when a group would need more
+        # than 5 distinct pitches, not on every big pitch leap) - within
+        # EACH such group, every distinct pitch must get its own lane.
+        groups = _group_into_hand_positions(notes)
+        idx = 0
+        for group in groups:
+            group_lanes = lanes[idx:idx + len(group)]
+            by_pitch: dict[int, set[int]] = {}
+            for (pitch, _fret), lane in zip(group, group_lanes):
+                by_pitch.setdefault(pitch, set()).add(lane)
+            collisions = {p: ls for p, ls in by_pitch.items() if len(ls) > 1}
+            assert not collisions, f"in-group collision: {collisions}"
+            idx += len(group)
 
     def test_real_section_g_regression_descending_run_spreads_out(self):
         # Regression guard for the bug found by playtest after v4/v5: a
@@ -217,8 +262,8 @@ class TestSingleNoteLanes:
         # proportional-distance formula, because deltas -2 and -3 both
         # rounded to the same lane step. Rank-ordering the group's
         # distinct pitches fixes this by construction.
-        pitches = [52, 50, 49, 50, 49, 47]
-        lanes = _single_note_lanes(pitches)
+        notes = [(52, 7), (50, 5), (49, 4), (50, 5), (49, 4), (47, 2)]
+        lanes = _single_note_lanes(notes)
         assert len(set(lanes)) >= 3, f"squashed to {sorted(set(lanes))}: {lanes}"
 
 
@@ -265,20 +310,29 @@ class TestChordDisjoint:
         base_lanes = [lanes[0] for lanes in lanes_seq]
         assert len(set(base_lanes)) >= 4, f"squashed to {sorted(set(base_lanes))}: {base_lanes}"
 
-    def test_gradual_chord_walk_stays_one_group_despite_wide_total_span(self):
+    def test_gradual_chord_walk_stays_one_group_unless_it_would_run_out_of_lanes(self):
         # Regression guard: chord grouping uses a ROLLING anchor (compare
         # each chord's root to the PREVIOUS chord's root), not a fixed
         # first-root anchor. A gradual walk where every step is small but
         # the first-to-last span exceeds HAND_POSITION_SEMITONES must
-        # still stay ONE group - confirmed necessary on the real section
-        # [F] progression (roots 56-57-59-61-62, each step <=4 semitones,
-        # first-to-last span is 6). A fixed-first-root anchor split this
-        # partway through, which meant the rank-order-across-the-group
-        # fix only ever saw half the progression's roots and still
-        # crowded distinct chords onto the same 1-2 lanes.
+        # still stay ONE group PROVIDED every root can still get its own
+        # lane - confirmed necessary on the real section [F] progression
+        # (roots 56-57-59-61-62, each step <=4 semitones, first-to-last
+        # span is 6). A fixed-first-root anchor split this partway
+        # through, which meant the rank-order-across-the-group fix only
+        # ever saw half the progression's roots and still crowded
+        # distinct chords onto the same 1-2 lanes.
+        #
+        # But these 5 roots are all root+octave power chords (width 1
+        # lane each), so only 4 of them can get distinct base lanes in a
+        # 5-lane highway (5 - 1 = 4) - the group must split once a 5th
+        # distinct root would make that impossible, rather than staying
+        # one group and silently colliding two roots onto the same lane.
         chords = [(56, 68), (57, 69), (59, 71), (61, 73), (62, 74)]
         groups = _group_chords_into_hand_positions(chords)
-        assert len(groups) == 1
+        assert len(groups) == 2
+        assert sorted({c[0] for c in groups[0]}) == [56, 57, 59, 61]
+        assert [c[0] for c in groups[1]] == [62]
 
     def test_repeated_chord_in_a_fast_progression_reuses_its_own_lane(self):
         # Companion to the section [F] spread test: within that same
@@ -314,7 +368,7 @@ class TestChartWriter:
         )
         assert 'Name = "Test Song"' in text
         assert "Resolution = 192" in text
-        assert "Offset = 0.25" in text
+        assert "Offset = -0.25" in text
         assert "0 = B 123000" in text
         assert "0 = TS 4\n" in text  # /4 -> exponent omitted
         assert "768 = TS 6 3" in text  # 6/8 -> exponent 3, tick 3840/5

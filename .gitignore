@@ -12,3 +12,12 @@ venv/
 test_data/*
 !test_data/.gitkeep
 songs/
+
+# Local ffmpeg binary distribution (optional, used by `convert --audio`/
+# `--album-art` if present) - a third-party binary redistribution, not
+# project source. See shred2chart/media.py for how it's located.
+/ffmpeg/
+
+# Reference/example .sng files a user drops in for comparison - personal
+# music library content, not project source (see test_data/ above).
+*.sng

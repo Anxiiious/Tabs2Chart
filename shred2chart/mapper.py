@@ -231,42 +231,76 @@ def _group_chords_into_hand_positions(
     span is 6) - a fixed-first-root anchor split this into two groups
     partway through, which meant the rank-order-across-the-group fix
     only saw half the progression's roots at once and still crowded
-    several distinct chords onto the same 1-2 lanes."""
+    several distinct chords onto the same 1-2 lanes.
+
+    A group is also cut off once it has accumulated as many distinct
+    roots as there is room for (5 lanes, minus whatever the group's
+    widest chord's own internal voicing needs to reserve) - a rolling
+    small-step anchor can otherwise "creep" a group across a much wider
+    span than any single hand position actually covers, packing more
+    distinct roots into the group than can possibly get distinct base
+    lanes (confirmed on a real progression, "Still Searching" track 1
+    section [H]: roots walk 54-57-59-61 then creep back down through
+    53-56-52-51, each step <=4 semitones but 7 distinct roots end up
+    needing to share a span that a 2-note chord's own width has already
+    narrowed to 4 lanes - rank-ordering by position alone then maps
+    several genuinely different roots onto the same lane pair, which
+    reads as "missed chord changes")."""
     groups: list[list[tuple[int, ...]]] = []
     current: list[tuple[int, ...]] = []
+    current_roots: set[int] = set()
+    current_max_width = 0
     prev_root: int | None = None
     for chord in chords:
         root = chord[0]
-        if prev_root is None or abs(root - prev_root) > HAND_POSITION_SEMITONES:
+        width = _chord_width_lanes(chord)
+        next_max_width = max(current_max_width, width)
+        next_distinct = len(current_roots | {root})
+        max_distinct_roots = 5 - next_max_width
+        would_overflow = next_distinct > max_distinct_roots
+        if prev_root is None or abs(root - prev_root) > HAND_POSITION_SEMITONES or would_overflow:
             if current:
                 groups.append(current)
             current = [chord]
+            current_roots = {root}
+            current_max_width = width
         else:
             current.append(chord)
+            current_roots.add(root)
+            current_max_width = next_max_width
         prev_root = root
     if current:
         groups.append(current)
     return groups
 
 
-def _rank_order_chord_roots(group: list[tuple[int, ...]]) -> dict[int, int]:
+def _rank_order_chord_roots(
+    group: list[tuple[int, ...]], center_lane: int
+) -> dict[int, int]:
     """Rank a hand-position group's DISTINCT chord roots and spread them
     evenly across the lane range still available after reserving room
-    for the widest chord's own internal voicing - so a cluster of nearby,
-    genuinely different chord shapes (e.g. a fast chord-progression run)
-    spreads across the neck instead of each independently computing a
-    leap that can crowd several shapes into the same corner (confirmed
-    against a real chord progression, "Still Searching" track 1 section
-    [F]: 5 nearby power-chord roots all landed on lanes 3-4 under the
-    per-chord leap+memo design, since several of them happened to
-    memoize high on first occurrence)."""
+    for the widest chord's own internal voicing, centered on center_lane
+    - so a cluster of nearby, genuinely different chord shapes (e.g. a
+    fast chord-progression run) spreads across the neck instead of each
+    independently computing a leap that can crowd several shapes into
+    the same corner (confirmed against a real chord progression, "Still
+    Searching" track 1 section [F]: 5 nearby power-chord roots all
+    landed on lanes 3-4 under the per-chord leap+memo design, since
+    several of them happened to memoize high on first occurrence)."""
     distinct_roots = sorted({chord[0] for chord in group})
     max_width = max(_chord_width_lanes(chord) for chord in group)
     available_span = 4 - max_width
     if len(distinct_roots) == 1:
-        return {distinct_roots[0]: min(CENTER_LANE, available_span)}
+        return {distinct_roots[0]: max(0, min(available_span, center_lane))}
+    # Proportional rank position across the available span. Safe from
+    # collisions/overflow by construction: _group_chords_into_hand_positions
+    # never lets a group accumulate more distinct roots than
+    # available_span + 1 can hold (see its docstring), so this plain
+    # round() always lands on distinct, in-range lanes - no post-hoc
+    # de-duping needed.
+    last = len(distinct_roots) - 1
     return {
-        root: round(i * available_span / (len(distinct_roots) - 1))
+        root: round(i * available_span / last)
         for i, root in enumerate(distinct_roots)
     }
 
@@ -275,42 +309,99 @@ def _chord_lanes_sequence(chords: list[tuple[int, ...]]) -> list[list[int]]:
     """Lane for each chord in a track, in order. Nearby chords (by root,
     within one hand position) are grouped and rank-ordered together, the
     same way _single_note_lanes rank-orders nearby single notes - see
-    _rank_order_chord_roots and the module docstring. Exact-repeat chord
-    shapes are memoized and replayed verbatim, same rationale as single
-    notes (real songs reprise chord progressions across sections too)."""
+    _rank_order_chord_roots and the module docstring. BETWEEN groups, the
+    next group's center lane comes from the same proportional-leap
+    formula as _single_note_lanes (off the previous group's LAST root,
+    since that's the hand position the player is actually coming from),
+    instead of every new group resetting to CENTER_LANE regardless of
+    where the song was already sitting on the neck - without this, a
+    group with only one distinct root (common: a riff sits on one power
+    chord for a while) always collapsed back to the same lane pair no
+    matter how far the song had actually moved, which is why real chord
+    progressions read as "stuck near green/red" even across big root
+    jumps between sections. Exact-repeat chord shapes are memoized and
+    replayed verbatim WITHIN one hand-position group (real riffs repeat
+    a shape many times in a row) - but the memo is scoped PER GROUP, not
+    global across the whole song: a global memo would let whichever
+    group happens to see a given chord shape first permanently lock its
+    lane for every later, unrelated occurrence, silently overriding that
+    later group's own rank-order spread (confirmed on a real
+    progression, "Still Searching" track 1 section [F]: chord (59,71)
+    first appears early in an unrelated group and memoizes to lanes
+    [3,4]; a much later group with roots 56-57-59-61 computes 59's local
+    rank-order lane as [2,3], but the global memo intercepted it first -
+    same for (61,73) and (62,74) - so 30 consecutive, genuinely
+    different chords all rendered as the same blue/orange shape)."""
     groups = _group_chords_into_hand_positions(chords)
     lanes_seq: list[list[int]] = []
-    memo: dict[tuple[int, ...], list[int]] = {}
+    prev_group_last_root: int | None = None
 
     for group in groups:
-        base_lane_by_root = _rank_order_chord_roots(group)
+        if prev_group_last_root is None:
+            center_lane = CENTER_LANE
+        else:
+            delta = group[0][0] - prev_group_last_root
+            lane_delta = round(delta / SEMITONES_PER_LANE)
+            if lane_delta == 0:
+                lane_delta = 1 if delta > 0 else (-1 if delta < 0 else 0)
+            center_lane = max(0, min(4, CENTER_LANE + lane_delta))
+        base_lane_by_root = _rank_order_chord_roots(group, center_lane)
+        group_memo: dict[tuple[int, ...], list[int]] = {}
         for chord in group:
-            cached = memo.get(chord)
+            cached = group_memo.get(chord)
             if cached is not None:
                 lanes_seq.append(cached)
                 continue
             base_lane = base_lane_by_root[chord[0]]
             lane_map = _chord_internal_lanes(chord, base_lane)
             chord_lanes = [lane_map[p] for p in chord if p in lane_map]
-            memo[chord] = chord_lanes
+            group_memo[chord] = chord_lanes
             lanes_seq.append(chord_lanes)
+        prev_group_last_root = group[-1][0]
     return lanes_seq
 
 
-def _group_into_hand_positions(pitches: list[int]) -> list[list[int]]:
-    """Split a sequence of single-note pitches into runs where every note
-    stays within HAND_POSITION_SEMITONES of the run's first pitch."""
-    groups: list[list[int]] = []
-    current: list[int] = []
-    anchor: int | None = None
-    for pitch in pitches:
-        if anchor is None or abs(pitch - anchor) > HAND_POSITION_SEMITONES:
+def _group_into_hand_positions(notes: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Split a sequence of (pitch, fret) single notes into runs where
+    every note stays within HAND_POSITION_SEMITONES of the PREVIOUS
+    note's FRET (a rolling anchor, not a fixed first-note anchor - same
+    rationale as the chord grouping's rolling anchor: a gradual walk
+    should stay one group even if its start and end are far apart).
+
+    Grouped by FRET, not pitch: a real guitarist's hand position is a
+    fret-span on the neck, not a pitch interval - the same fret on a
+    lower string sounds many semitones apart from a higher string, but
+    costs the hand nothing to reach (confirmed on a real lead lick,
+    "Still Searching" track 1 ticks 92000-110880: pitch 61 - a low pedal
+    tone on string 3, fret 11 - alternates against a moving voice on
+    strings 4-6, frets 9-15; every pitch delta between them is >4
+    semitones, up to 17, but the whole phrase sits in a tight 6-fret
+    span. Grouping by pitch fragmented this into ~20 one-note groups,
+    each leaping independently from a reset center lane, so several
+    different high notes collapsed onto the same clamped lane and the
+    phrase read as only two buttons repeating).
+
+    A group is also cut off once it has accumulated as many distinct
+    pitches as there is room for (5 lanes), so _rank_order_lanes always
+    has enough lanes to keep every distinct pitch in the group
+    separate."""
+    groups: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
+    current_distinct: set[int] = set()
+    prev_fret: int | None = None
+    for note in notes:
+        pitch, fret = note
+        next_distinct = len(current_distinct | {pitch})
+        would_overflow = pitch not in current_distinct and next_distinct > 5
+        if prev_fret is None or abs(fret - prev_fret) > HAND_POSITION_SEMITONES or would_overflow:
             if current:
                 groups.append(current)
-            current = [pitch]
-            anchor = pitch
+            current = [note]
+            current_distinct = {pitch}
         else:
-            current.append(pitch)
+            current.append(note)
+            current_distinct.add(pitch)
+        prev_fret = fret
     if current:
         groups.append(current)
     return groups
@@ -328,10 +419,13 @@ def _rank_order_lanes(group: list[int], center_lane: int) -> list[int]:
     return [rank_to_lane[pitch] for pitch in group]
 
 
-def _single_note_lanes(pitches: list[int]) -> list[int]:
-    """Lane for each single note in a track, in order. See the module
-    docstring for the full rank-order + leap + memoize design."""
-    groups = _group_into_hand_positions(pitches)
+def _single_note_lanes(notes: list[tuple[int, int]]) -> list[int]:
+    """Lane for each single (pitch, fret) note in a track, in order. See
+    the module docstring for the full rank-order + leap + memoize
+    design. Grouping uses fret (hand position); lane rank-ordering
+    within/between groups uses pitch (melodic contour) - see
+    _group_into_hand_positions."""
+    groups = _group_into_hand_positions(notes)
     lanes: list[int] = []
     anchor_lane = CENTER_LANE
     prev_group_first_pitch: int | None = None
@@ -342,7 +436,8 @@ def _single_note_lanes(pitches: list[int]) -> list[int]:
     memo: dict[tuple[int, ...], tuple[int, ...]] = {}
 
     for gi, group in enumerate(groups):
-        key = tuple(group)
+        pitches = [pitch for pitch, _fret in group]
+        key = tuple(pitches)
         cached = memo.get(key)
         if cached is not None:
             group_lanes = list(cached)
@@ -350,12 +445,12 @@ def _single_note_lanes(pitches: list[int]) -> list[int]:
             if gi == 0:
                 center_lane = CENTER_LANE
             else:
-                delta = group[0] - prev_group_first_pitch
+                delta = pitches[0] - prev_group_first_pitch
                 lane_delta = round(delta / SEMITONES_PER_LANE)
                 if lane_delta == 0:
                     lane_delta = 1 if delta > 0 else (-1 if delta < 0 else 0)
                 center_lane = max(0, min(4, anchor_lane + lane_delta))
-            group_lanes = _rank_order_lanes(group, center_lane)
+            group_lanes = _rank_order_lanes(pitches, center_lane)
 
             # Boundary nudge: if this group's first note would land on the
             # exact same lane as the previous group's last note despite a
@@ -365,9 +460,9 @@ def _single_note_lanes(pitches: list[int]) -> list[int]:
             if (
                 prev_group_last_pitch is not None
                 and group_lanes[0] == prev_group_last_lane
-                and group[0] != prev_group_last_pitch
+                and pitches[0] != prev_group_last_pitch
             ):
-                direction = 1 if group[0] > prev_group_last_pitch else -1
+                direction = 1 if pitches[0] > prev_group_last_pitch else -1
                 if all(0 <= lane + direction <= 4 for lane in group_lanes):
                     group_lanes = [lane + direction for lane in group_lanes]
                 elif all(0 <= lane - direction <= 4 for lane in group_lanes):
@@ -376,8 +471,8 @@ def _single_note_lanes(pitches: list[int]) -> list[int]:
 
         lanes.extend(group_lanes)
         anchor_lane = CENTER_LANE
-        prev_group_first_pitch = group[0]
-        prev_group_last_pitch = group[-1]
+        prev_group_first_pitch = pitches[0]
+        prev_group_last_pitch = pitches[-1]
         prev_group_last_lane = group_lanes[-1]
     return lanes
 
@@ -400,19 +495,19 @@ def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
     # uninterrupted stream to group/rank/memoize (an open note or a chord
     # in between two single notes shouldn't count as a "leap"). Chords get
     # the same continuous-stream treatment via _chord_lanes_sequence.
-    single_note_pitches: list[int] = []
+    single_notes: list[tuple[int, int]] = []  # (pitch, fret)
     single_note_positions: list[int] = []  # index into ordered_groups
     chord_shapes: list[tuple[int, ...]] = []
     chord_positions: list[int] = []
     for gi, ((tick, _), group) in enumerate(ordered_groups):
         if len(group) == 1:
             if not (group[0]["fret"] == 0 and group[0]["string"] == chug_string):
-                single_note_pitches.append(group[0]["pitch"] or 0)
+                single_notes.append((group[0]["pitch"] or 0, group[0]["fret"] or 0))
                 single_note_positions.append(gi)
         else:
             chord_shapes.append(tuple(sorted(n["pitch"] or 0 for n in group)))
             chord_positions.append(gi)
-    single_lanes = _single_note_lanes(single_note_pitches)
+    single_lanes = _single_note_lanes(single_notes)
     lanes_by_position = dict(zip(single_note_positions, single_lanes))
     chord_lanes_seq = _chord_lanes_sequence(chord_shapes)
     lanes_by_position.update(zip(chord_positions, chord_lanes_seq))

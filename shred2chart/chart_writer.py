@@ -5,7 +5,13 @@ GuitarGame_ChartFormats — Format-Overview and 5-Fret-Guitar pages), per
 the game plan's "do not code note flags from memory" mandate:
 
 - [Song]: Resolution = ticks per quarter (we emit 192, the standard);
-  Offset is in *seconds* (decimal); string values are quoted.
+  Offset is in *seconds* (decimal); string values are quoted. Sign
+  convention (confirmed empirically against Moonscraper/CH, since the
+  community docs don't pin it): NEGATIVE delays the audio relative to
+  the chart. We add silent lead-in bars by shifting the chart's notes
+  later while leaving song.ogg untouched, so the audio needs to start
+  LATER relative to the chart's new tick 0 - hence Offset/delay are the
+  lead-in duration negated, not the lead-in duration itself.
 - [SyncTrack]: `tick = B <bpm*1000>` (last 3 digits are decimals);
   `tick = TS <numerator> [<log2 denominator>]`, exponent omitted for /4.
 - [Events]: `tick = E "section <name>"`.
@@ -127,7 +133,7 @@ def build_chart(
         f'  Name = "{title}"',
         f'  Artist = "{artist}"',
         '  Charter = "shred2chart"',
-        f"  Offset = {offset_ms / 1000}",
+        f"  Offset = {-offset_ms / 1000}",
         f"  Resolution = {CHART_RESOLUTION}",
         '  MusicStream = "song.ogg"',
     ]
@@ -146,7 +152,7 @@ def build_song_ini(title: str, artist: str, offset_ms: int = 0) -> str:
         f"name = {title}\n"
         f"artist = {artist}\n"
         "charter = shred2chart\n"
-        f"delay = {offset_ms}\n"
+        f"delay = {-offset_ms}\n"
         "diff_guitar = -1\n"
     )
 
