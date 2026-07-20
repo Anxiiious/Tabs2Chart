@@ -160,7 +160,9 @@ def _prompt_convert_options(
     out_text = input(f"Output folder [{default_out}]: ").strip()
     out_dir = Path(out_text).expanduser() if out_text else default_out
     if out_dir.exists() and any(out_dir.iterdir()):
-        answer = input(f"{out_dir} is not empty. Overwrite its files? [y/N]: ").strip().lower()
+        answer = input(
+            f"{out_dir} is not empty. Overwrite its files? [y/N, default: No]: "
+        ).strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled; no files were written.")
             return None
