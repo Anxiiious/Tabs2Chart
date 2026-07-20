@@ -1,15 +1,21 @@
 """IR notes -> Clone Hero 5-lane note events (Stage 4, M4 contour mapping).
 
-- **Single notes use a threshold-based static-anchor contour** (see
-  `_LaneContour`/`_assign_lanes`): lanes move *relative* to a hand-position
-  anchor rather than from absolute pitch, so a melody reads as a smooth
-  up/down contour instead of jumping around whenever pitch-mod-5 happens
-  to land far away. The anchor stays fixed while the melody moves within
-  one hand position (a real guitarist doesn't shift position for every
-  note), and re-centers only on a genuine position-shift-sized leap. This
-  also gives pattern stability: the same riff played twice in the same
-  fret position maps to the identical lane sequence both times, since the
-  anchor isn't drifting note-to-note.
+- **Single notes use a static-anchor contour with proportional lane steps**
+  (see `_LaneContour`/`_assign_lanes`): lanes move *relative* to a
+  hand-position anchor rather than from absolute pitch, so a melody reads
+  as a smooth up/down contour instead of jumping around whenever
+  pitch-mod-5 happens to land far away. The anchor stays fixed while the
+  melody moves within one hand position (a real guitarist doesn't shift
+  position for every note), re-centering only on a genuine
+  position-shift-sized leap (`HAND_POSITION_SEMITONES`). Lane movement is
+  proportional to how far the pitch actually moved
+  (`SEMITONES_PER_LANE`) rather than a flat +-1 step — a v1 version used
+  a flat step and wide, repeat-alternating leaps got stuck oscillating in
+  2 lanes at whichever edge the anchor first clamped against (confirmed
+  against a real lead lick; see SHRED2CHART_GAMEPLAN.md's 2026-07-19
+  entry). The static anchor also gives pattern stability for the common
+  case: the same riff played twice in the same hand position maps to the
+  identical lane sequence both times.
 - **Ties merge into sustains** (the EOF-confirmed behavior): a note with
   `tied: True` extends the previous note at the same string+pitch
   instead of becoming a new attack.
@@ -55,9 +61,18 @@ FORCED_FLAG = 5
 TAP_FLAG = 6
 
 # A note within this many semitones of the anchor is considered "the same
-# hand position" (roughly a real guitarist's 4-5 fret span) - the anchor
-# doesn't move for it. Bigger jumps re-center the anchor on the new pitch.
+# hand position" (roughly a real guitarist's 4-5 fret span) - crossing it
+# re-centers the anchor on the new pitch (see _assign_lanes).
 HAND_POSITION_SEMITONES = 4
+
+# How many semitones of pitch movement equal one lane step. Proportional
+# (not flat +-1) so a wide leap visibly spreads across more of the neck
+# than a small one, instead of both moving identically - a flat step let
+# repeat-alternating wide leaps get stuck oscillating in 2 lanes at
+# whichever edge the anchor first clamped against (confirmed against a
+# real 40-note lead lick, tick 92000-110880 of "Still Searching" track 1,
+# during M4 v2 - see SHRED2CHART_GAMEPLAN.md's 2026-07-19 entry).
+SEMITONES_PER_LANE = 3
 
 # Chord pitches (sorted) more than an octave apart get a lane gap instead
 # of stacking contiguous - adjacent lanes should mean "close together."
@@ -149,19 +164,25 @@ def _assign_lanes(
             return [contour.anchor_lane]
 
         delta = pitch - contour.anchor_pitch
-        if abs(delta) > HAND_POSITION_SEMITONES:
-            # Position shift: re-center the anchor one step from where it
-            # was, then the new pitch is "at" the (now current) anchor.
-            step = 1 if delta > 0 else -1
-            contour.anchor_pitch = pitch
-            contour.anchor_lane = max(0, min(4, contour.anchor_lane + step))
+        if delta == 0:
             return [contour.anchor_lane]
 
-        # Within one hand position: lane is a pure function of the STATIC
-        # anchor, not incremental from the last note - this is what makes
-        # the same riff in the same position map identically every time.
-        step = 0 if delta == 0 else (1 if delta > 0 else -1)
-        return [max(0, min(4, contour.anchor_lane + step))]
+        # Lane movement is proportional to how far the pitch actually
+        # moved (not a flat +-1), so a wide leap spreads further across
+        # the neck than a small one - see SEMITONES_PER_LANE above.
+        lane_delta = round(delta / SEMITONES_PER_LANE)
+        if lane_delta == 0:
+            lane_delta = 1 if delta > 0 else -1  # any nonzero delta moves >=1 lane
+        new_lane = max(0, min(4, contour.anchor_lane + lane_delta))
+
+        if abs(delta) > HAND_POSITION_SEMITONES:
+            # Position shift: this note becomes the new anchor, at the
+            # lane just computed - preserves both direction and magnitude
+            # rather than snapping to an absolute-pitch lane.
+            contour.anchor_pitch = pitch
+            contour.anchor_lane = new_lane
+
+        return [new_lane]
 
     pitches = sorted({n["pitch"] or 0 for n in group})
     width = min(len(pitches), 3)

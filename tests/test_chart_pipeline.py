@@ -134,15 +134,16 @@ class TestLaneContour:
         assert contour.anchor_pitch == 60  # anchor never moved
 
     def test_ascending_run_crossing_hand_positions_is_monotonic(self):
-        # A run that actually crosses hand-position boundaries (leaps > 4
-        # semitones each step) re-centers the anchor each time and climbs
-        # one lane per leap - this IS the case that should read as "going up."
+        # A run that crosses hand-position boundaries (leaps > 4 semitones
+        # each step) re-centers the anchor each time and climbs in
+        # proportion to the leap size - here each +6 semitone leap is
+        # round(6/3)=2 lanes, so it climbs 0 -> 2 -> 4 -> clamped at 4.
         contour = _LaneContour()
         lanes = [
-            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 67, 74, 81)
+            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 66, 72, 78)
         ]
-        assert lanes == [0, 1, 2, 3]
-        assert contour.anchor_pitch == 81  # re-centered on every leap
+        assert lanes == [0, 2, 4, 4]
+        assert contour.anchor_pitch == 78  # re-centered on every leap
 
     def test_descending_run_clamps_at_zero(self):
         contour = _LaneContour()
@@ -179,7 +180,10 @@ class TestLaneContour:
         _assign_lanes(self._single(60), None, contour)  # anchor=60, lane=0
         lane = _assign_lanes(self._single(72), None, contour)[0]  # delta=12
         assert contour.anchor_pitch == 72  # re-centered on the new pitch
-        assert lane == 1  # one step from where the anchor's lane just was
+        # round(12/3)=4 lanes of movement, proportional to the leap size -
+        # not a flat +-1 (that was the v1 bug that caused "stuck high"
+        # oscillation on real wide-ranging lead lines).
+        assert lane == 4
 
     def test_open_note_bypasses_contour_and_does_not_touch_anchor(self):
         contour = _LaneContour()
@@ -187,6 +191,30 @@ class TestLaneContour:
         group = [{"pitch": 36, "fret": 0, "string": 1}]
         assert _assign_lanes(group, chug_string=1, contour=contour) == [7]
         assert contour.anchor_pitch == 60  # untouched by the open note
+
+    def test_real_lead_lick_regression_spreads_across_lanes(self):
+        # Regression guard for the M4 v1 "stuck high" bug: a real wide-
+        # ranging lead lick (Still Searching, track 1, ticks 92000-110880,
+        # spanning 17 semitones) got jammed onto just 2 adjacent lanes
+        # under v1's flat +-1 step. The proportional formula must spread
+        # it across at least 3 distinct lanes.
+        pitches = [
+            68, 61, 73, 61, 69, 69, 61, 68, 66, 66, 61, 76, 78, 78, 76, 73, 61, 73,
+            61, 69, 69, 61, 68, 66, 66, 73, 74, 76, 76, 74, 73, 69, 61, 73, 61, 69,
+            69, 61, 68, 66,
+        ]
+        contour = _LaneContour()
+        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in pitches]
+        assert len(set(lanes)) >= 3, f"squashed to {sorted(set(lanes))}: {lanes}"
+        # Pitch 61 (the recurring low pedal tone) settles onto one lane
+        # once its own anchor is established - its very first occurrence
+        # is still relative to whatever anchor preceded it, but every
+        # occurrence after that should land on the same lane, not oscillate.
+        sixty_one_indices = [i for i, p in enumerate(pitches) if p == 61]
+        lanes_after_first_occurrence = [lanes[i] for i in sixty_one_indices[1:]]
+        assert len(set(lanes_after_first_occurrence)) == 1, (
+            f"61 landed on inconsistent lanes after settling: {lanes_after_first_occurrence}"
+        )
 
 
 class TestChordDisjoint:
