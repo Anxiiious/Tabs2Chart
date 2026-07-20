@@ -7,12 +7,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import xml.etree.ElementTree as ET
 
-from . import blend, chart_writer, gpif_tempo, gpx_reader, ir_gp, ir_gpif, mapper, tempo
+from . import (
+    blend, chart_writer, gpif_tempo, gpx_reader, integration, ir_gp, ir_gpif,
+    mapper, tempo, validation,
+)
 
 _CONTAINER_SUFFIXES = {".gp", ".gpx"}
 
@@ -122,6 +128,85 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
+def _safe_path_part(value: str) -> str:
+    """Keep metadata-derived output paths within the songs directory."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "_", value)
+    cleaned = cleaned.replace("/", "_").replace("\\", "_").replace(":", "_").strip(" .")
+    return cleaned or "Untitled"
+
+
+def _default_output_dir(artist: str, title: str) -> Path:
+    return Path("songs") / f"{_safe_path_part(artist)} - {_safe_path_part(title)}"
+
+
+def _prepare_audio(audio: str | Path, out_dir: Path) -> Path:
+    source = Path(audio).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"audio file does not exist: {source}")
+    target = out_dir / "song.ogg"
+    if source.suffix.lower() == ".ogg":
+        shutil.copy2(source, target)
+        return target
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("non-OGG audio requires ffmpeg on PATH")
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(source), "-vn", "-acodec", "libvorbis", str(target)],
+            check=True, capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "unknown ffmpeg error"
+        raise RuntimeError(f"ffmpeg could not convert audio: {detail}") from exc
+    return target
+
+
+def _prompt_convert_options(
+    args: argparse.Namespace,
+    tracks: list[tuple[int, str]],
+    track_ids: list[int],
+    names: dict[int, str],
+    artist: str,
+    title: str,
+) -> tuple[list[int], Path] | None:
+    """Let an interactive user review track and output choices before writing."""
+    print("\nInteractive conversion")
+    print("Available tracks:")
+    for track_id, name in tracks:
+        marker = "*" if track_id in track_ids else " "
+        print(f"  {marker} {track_id}: {name}")
+
+    default_tracks = ",".join(str(track_id) for track_id in track_ids)
+    while True:
+        selected = input(f"Tracks to blend [{default_tracks}]: ").strip() or default_tracks
+        try:
+            selected_ids = [int(track_id.strip()) for track_id in selected.split(",")]
+        except ValueError:
+            print("Please enter comma-separated track numbers.")
+            continue
+        unknown = [track_id for track_id in selected_ids if track_id not in names]
+        if unknown:
+            print(f"Unknown track(s): {', '.join(map(str, unknown))}")
+            continue
+        break
+
+    if not getattr(args, "audio", None):
+        print("Provide an audio file named song.ogg in the output folder before playing.")
+    default_out = Path(args.out) if args.out else _default_output_dir(artist, title)
+    out_text = input(f"Output folder [{default_out}]: ").strip()
+    out_dir = Path(out_text).expanduser() if out_text else default_out
+    if out_dir.exists() and any(out_dir.iterdir()):
+        answer = input(
+            f"{out_dir} is not empty. Overwrite its files? [y/N, default: No]: "
+        ).strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled; no files were written.")
+            return None
+
+    print("Use --offset-ms if the chart needs audio-sync adjustment later.")
+    return selected_ids, out_dir
+
+
 def _cmd_convert(args: argparse.Namespace) -> int:
     path = Path(args.gp_file)
     if path.suffix.lower() not in _CONTAINER_SUFFIXES:
@@ -160,8 +245,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         track_ids = _guess_guitar_tracks(tracks)
 
     names = dict(tracks)
-    print(f"{title} - {artist}")
-    print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
+    if args.interactive:
+        interactive_options = _prompt_convert_options(args, tracks, track_ids, names, artist, title)
+        if interactive_options is None:
+            return 0
+        track_ids, interactive_out = interactive_options
+    else:
+        interactive_out = None
+    if not args.json:
+        print(f"{title} - {artist}")
+        print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
     tempo_events = gpif_tempo.dump_tempo_events(xml_text)
     sections = gpif_tempo.dump_sections(xml_text)
@@ -176,24 +269,65 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
             for i in range(0, len(bar_starts), 8)
         ]
-        print("(no section markers in file - blending in 8-bar windows instead)")
+        if not args.json:
+            print("(no section markers in file - blending in 8-bar windows instead)")
 
     tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
     blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
     chart_notes = mapper.map_notes(blended)
 
-    print(f"\n{len(sections)} section(s), {len(blended)} notes after blending, "
-          f"{len(chart_notes)} chart events:")
-    for choice in choices:
-        print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
+    if not args.json:
+        print(f"\n{len(sections)} section(s), {len(blended)} notes after blending, "
+              f"{len(chart_notes)} chart events:")
+        for choice in choices:
+            print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
-    out_dir = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    if interactive_out is not None:
+        out_dir = interactive_out
+    elif args.out:
+        out_dir = Path(args.out)
+    else:
+        out_dir = _default_output_dir(artist, title)
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
     )
-    print(f"\nwrote {out_dir}/notes.chart and song.ini")
-    print("Drop the song's audio in that folder as song.ogg, then copy the folder "
-          "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
+    audio_source = None
+    if args.audio:
+        try:
+            audio_source = Path(args.audio).expanduser()
+            _prepare_audio(audio_source, out_dir)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    errors = validation.validate_song_folder(
+        out_dir, title, artist, tempo_events, audio_required=bool(args.audio)
+    )
+    if errors:
+        print("error: generated folder failed validation:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+    manifest = integration.write_manifest(
+        out_dir, title, artist, tempo_events, sections, len(chart_notes),
+        offset_ms=args.offset_ms, audio_path=audio_source,
+    )
+    if args.json:
+        print(json.dumps(manifest, indent=2))
+    else:
+        print(f"\nwrote {out_dir}/notes.chart, song.ini, and moon-scraper-manifest.json")
+        if args.audio:
+            print(f"copied audio to {out_dir}/song.ogg")
+        print("Drop the folder into Clone Hero's Songs directory (or open notes.chart in Moon Scraper).")
+    return 0
+
+
+def _cmd_moon_scraper(args: argparse.Namespace) -> int:
+    try:
+        result = integration.invoke_moon_scraper(args.manifest, args.command, args.timeout)
+    except (FileNotFoundError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"error: Moon Scraper integration failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -326,9 +460,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
-        help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+        help="audio offset in milliseconds (calibrate in Moon Scraper later; default 0)",
+    )
+    p_convert.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="review tracks and output folder interactively before writing",
+    )
+    p_convert.add_argument(
+        "--audio", help="audio input; copied as song.ogg or converted with ffmpeg",
+    )
+    p_convert.add_argument(
+        "--json", action="store_true",
+        help="emit a versioned machine-readable Moon Scraper manifest",
     )
     p_convert.set_defaults(func=_cmd_convert)
+
+    p_moon = sub.add_parser(
+        "moon-scraper", help="send a manifest to a custom Moon Scraper fork",
+    )
+    p_moon.add_argument("manifest", help="path to moon-scraper-manifest.json")
+    p_moon.add_argument(
+        "--command", required=True,
+        help="fork command; manifest JSON is sent to its standard input",
+    )
+    p_moon.add_argument("--timeout", type=int, default=300)
+    p_moon.set_defaults(func=_cmd_moon_scraper)
 
     p_verify = sub.add_parser(
         "verify-m0",

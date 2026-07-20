@@ -52,10 +52,33 @@ Commands so far, run as `shred2chart <command>`:
 | `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
 | `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide in/out, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties, accent, ghost note) — as JSON. |
 | `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority, `--offset-ms` for audio sync. |
+| `shred2chart moon-scraper manifest.json --command 'your-fork --stdin'` | Sends a generated machine-readable manifest to a custom Moon Scraper fork over stdin. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 `convert` is the one that makes something playable; the rest are inspection tools that show you
 (and your coding agent) what's inside a file.
+
+For pipeline integration, `convert` can copy/convert audio and emit a versioned manifest:
+
+```bash
+shred2chart convert your_song.gp --audio recording.flac --json
+shred2chart moon-scraper songs/Artist\ -\ Title/moon-scraper-manifest.json \
+  --command 'path/to/moonscraper-fork --manifest-stdin'
+```
+
+The manifest (`moon-scraper-manifest.json`) is the hand-off contract. It contains the schema
+version, absolute chart/metadata/audio paths, source metadata, tempo and section events, chart
+event count, and offset. The fork should read JSON from stdin and return exit code 0; its stdout
+and stderr are captured by the adapter. Non-OGG audio is converted to `song.ogg` with `ffmpeg`.
+Without `--audio`, the existing manual Clone Hero/Moon Scraper workflow is unchanged.
+
+For a guided first conversion, add `--interactive`. It shows the detected tracks, lets you adjust
+the tracks and output folder, warns before writing into a non-empty folder, and reminds you that
+the generated folder expects an audio file named `song.ogg`:
+
+```bash
+shred2chart convert your_song.gp --interactive
+```
 
 ## 4. Your next concrete step
 
@@ -120,7 +143,7 @@ says every session must record it in the "Current State" section before moving o
   the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
   next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
   notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
-  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moonscraper.**
+  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moon Scraper.**
 
 See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
 the detailed, up-to-date picture.
