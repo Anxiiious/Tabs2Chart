@@ -12,7 +12,7 @@ from pathlib import Path
 
 import xml.etree.ElementTree as ET
 
-from . import blend, chart_writer, gpif_tempo, gpx_reader, ir_gp, ir_gpif, mapper, tempo
+from . import blend, chart_writer, gpif_tempo, gpx_reader, ir_gp, ir_gpif, mapper, media, tempo
 
 _CONTAINER_SUFFIXES = {".gp", ".gpx"}
 
@@ -171,7 +171,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     # phrase-ish scale instead of collapsing to one whole-song pick.
     blend_spans = sections
     if not blend_spans and len(track_ids) > 1:
-        bar_starts, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
         blend_spans = [
             {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
             for i in range(0, len(bar_starts), 8)
@@ -192,8 +192,42 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
     )
     print(f"\nwrote {out_dir}/notes.chart and song.ini")
-    print("Drop the song's audio in that folder as song.ogg, then copy the folder "
-          "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
+
+    if args.audio:
+        audio_path = Path(args.audio)
+        if not audio_path.exists():
+            print(f"warning: --audio file not found: {audio_path}", file=sys.stderr)
+        elif not media.ffmpeg_available():
+            print(
+                "warning: ffmpeg not found on PATH, skipping audio conversion "
+                f"(convert {audio_path.name} to song.ogg manually and drop it in {out_dir})",
+                file=sys.stderr,
+            )
+        else:
+            written = media.convert_audio(audio_path, out_dir)
+            if written:
+                print(f"wrote {written}")
+            else:
+                print(f"warning: ffmpeg failed to convert {audio_path}", file=sys.stderr)
+    else:
+        print("Drop the song's audio in that folder as song.ogg, then copy the folder "
+              "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
+
+    if args.album_art:
+        art_path = Path(args.album_art)
+        if not art_path.exists():
+            print(f"warning: --album-art file not found: {art_path}", file=sys.stderr)
+        else:
+            written = media.place_album_art(art_path, out_dir)
+            if written:
+                print(f"wrote {written}")
+            else:
+                print(
+                    f"warning: could not place album art from {art_path} "
+                    "(ffmpeg not found on PATH and source isn't a .png)",
+                    file=sys.stderr,
+                )
+
     return 0
 
 
@@ -327,6 +361,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
         help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+    )
+    p_convert.add_argument(
+        "--audio",
+        help="path to the song's audio file (any format ffmpeg can read); "
+        "converted to song.ogg in the output folder automatically (requires ffmpeg on PATH)",
+    )
+    p_convert.add_argument(
+        "--album-art",
+        help="path to cover art (png/jpg/etc); placed as album.png in the output folder "
+        "(non-png sources require ffmpeg on PATH)",
     )
     p_convert.set_defaults(func=_cmd_convert)
 

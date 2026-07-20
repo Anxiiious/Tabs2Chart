@@ -171,7 +171,7 @@ def dump_ir(xml_text: str, track_index: int = 0) -> list[dict[str, Any]]:
     primary voice. `track_index` matches the `<Track id>` in the GPIF
     (0-based, in file order)."""
     root = ET.fromstring(xml_text)
-    bar_starts, _ = compute_bar_grid(root)
+    bar_starts, _, bar_source_index = compute_bar_grid(root)
 
     tracks_el = root.find("./MasterTrack/Tracks")
     if tracks_el is None or not tracks_el.text:
@@ -192,7 +192,11 @@ def dump_ir(xml_text: str, track_index: int = 0) -> list[dict[str, Any]]:
     chord_counter = 0
     previous_fret: int | None = None
 
-    for bar_index, master_bar in enumerate(master_bars):
+    # Walk *play positions* (performance order) rather than written order, so
+    # bars inside repeats emit their notes once per pass at the correct ticks.
+    # bar_source_index[play_pos] maps back to the file-order <MasterBar>.
+    for play_pos, bar_index in enumerate(bar_source_index):
+        master_bar = master_bars[bar_index]
         bars_ref_el = master_bar.find("Bars")
         if bars_ref_el is None or not bars_ref_el.text:
             raise GpifFormatError(f"MasterBar {bar_index} has no <Bars> reference list")
@@ -208,7 +212,7 @@ def dump_ir(xml_text: str, track_index: int = 0) -> list[dict[str, Any]]:
         beats_ref_el = voices_by_id[voice_id].find("Beats")
         beat_ids = [int(x) for x in beats_ref_el.text.split()] if beats_ref_el is not None and beats_ref_el.text else []
 
-        tick = bar_starts[bar_index]
+        tick = bar_starts[play_pos]
         for beat_id in beat_ids:
             beat_el = beats_by_id[beat_id]
             rhythm_ref_el = beat_el.find("Rhythm")
