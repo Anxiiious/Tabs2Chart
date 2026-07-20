@@ -7,6 +7,7 @@ commands. Every command prints plain, readable output - no GUI required.
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import logging
 import platform
@@ -310,7 +311,8 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     if _validate_input_file(path, _ALL_SUFFIXES):
         return 1
 
-    charter = getattr(args, "charter", None) or "shred2chart"
+    # Keep the user-supplied charter value (may be "" if flag not given).
+    args_charter = getattr(args, "charter", "") or ""
     quiet = getattr(args, "quiet", False)
 
     def _info(*msg: object) -> None:
@@ -329,8 +331,8 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     # Resolve metadata
     if is_container and xml_text is not None:
         title, artist, credit = _get_gpx_metadata(xml_text, path)
-        if not charter or charter == "shred2chart":
-            charter = credit or "shred2chart"
+        # Priority: explicit --charter flag > GP SubTitle credit field > default
+        charter = args_charter or credit or "shred2chart"
         tracks = ir_gpif.list_tracks(xml_text)
     else:
         # Legacy PyGuitarPro path: extract metadata from the parsed song
@@ -338,10 +340,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             import guitarpro  # noqa: PLC0415
             song = guitarpro.parse(str(path))
         except Exception as e:
-            print(f"error parsing {path}: {e}", file=sys.stderr)
+            print(
+                f"error parsing {path}: {e}\n"
+                "(legacy .gp3/.gp4/.gp5 support requires PyGuitarPro; "
+                "run: pip install PyGuitarPro)",
+                file=sys.stderr,
+            )
             return 1
         title = getattr(song, "title", "") or path.stem
         artist = getattr(song, "artist", "") or "Unknown Artist"
+        charter = args_charter or "shred2chart"
         tracks = ir_gp.list_tracks(path)
 
     if args.tracks:
@@ -494,8 +502,11 @@ def _estimate_bar_starts(tempo_events: list[dict]) -> list[int]:
     """
     from .mapper import IR_TICKS_PER_QUARTER  # noqa: PLC0415
     ticks_per_bar = IR_TICKS_PER_QUARTER * 4
-    # Find the last tick from tempo events as a rough song-length upper bound
-    max_tick = max((e["tick"] for e in tempo_events), default=0) + ticks_per_bar * 100
+    # Conservative upper bound: last tempo-event tick + enough bars to cover
+    # a typical song length.  The bar grid is only used for blend windows, so
+    # over-estimating is harmless.
+    _FALLBACK_BAR_COUNT = 200  # well above any realistic song length
+    max_tick = max((e["tick"] for e in tempo_events), default=0) + ticks_per_bar * _FALLBACK_BAR_COUNT
     return list(range(0, max_tick, ticks_per_bar))
 
 
@@ -534,7 +545,6 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     # Read song.ini to get name and artist for validation.
     song_ini = out_dir / "song.ini"
-    import configparser  # noqa: PLC0415
     parser = configparser.ConfigParser()
     parser.read(song_ini, encoding="utf-8")
     title = parser.get("song", "name", fallback="")
@@ -726,7 +736,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_convert.add_argument(
         "--charter", default="",
-        help="charter name written into song.ini and notes.chart (default: shred2chart)",
+        help=(
+            "charter name written into song.ini and notes.chart. "
+            "For GP7/8 files, the GP SubTitle field is used as a fallback "
+            "when this flag is not set. Final default: 'shred2chart'."
+        ),
     )
     p_convert.add_argument(
         "--archive", action="store_true",

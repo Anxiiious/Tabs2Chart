@@ -11,6 +11,8 @@ file, so they can run in CI.
 """
 from __future__ import annotations
 
+import re
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -53,7 +55,6 @@ def test_convert_chart_contains_notes(tmp_path):
     chart = (out / "notes.chart").read_text(encoding="utf-8")
     assert "[ExpertSingle]" in chart
     # At least one note line
-    import re
     assert re.search(r"=\s*N\s+\d", chart), "chart has no note events"
 
 
@@ -89,7 +90,6 @@ def test_convert_archive_flag(tmp_path):
     assert rc == 0
     zips = list(tmp_path.glob("*.zip"))
     assert len(zips) == 1, f"expected one zip archive, found: {zips}"
-    import zipfile
     with zipfile.ZipFile(zips[0]) as zf:
         names = zf.namelist()
     assert any("notes.chart" in n for n in names)

@@ -166,6 +166,11 @@ class _ContourTracker:
         # Use at least _MIN_WINDOW_SPAN semitones so notes near each other
         # still spread across lanes rather than collapsing to one.
         effective_span = max(span, _MIN_WINDOW_SPAN)
+        # Defensive guard against division by zero: unreachable while
+        # _MIN_WINDOW_SPAN >= 1, but protects against future tuning changes.
+        if effective_span == 0:
+            self._pitch_to_lane = {p: 0 for p in set(self._window)}
+            return
         new_cache: dict[int, int] = {}
         for p in set(self._window):
             new_cache[p] = round((p - lo) / effective_span * 4)
