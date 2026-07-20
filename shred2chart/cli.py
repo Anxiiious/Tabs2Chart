@@ -122,6 +122,10 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
+def _default_output_dir(artist: str, title: str) -> Path:
+    return Path(f"songs/{artist} - {title}")
+
+
 def _prompt_convert_options(
     args: argparse.Namespace,
     tracks: list[tuple[int, str]],
@@ -154,7 +158,7 @@ def _prompt_convert_options(
             continue
         break
 
-    default_out = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    default_out = Path(args.out) if args.out else _default_output_dir(artist, title)
     out_text = input(f"Output folder [{default_out}]: ").strip()
     out_dir = Path(out_text).expanduser() if out_text else default_out
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -243,7 +247,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     out_dir = (
         interactive_out
         if interactive_out is not None
-        else Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+        else Path(args.out) if args.out else _default_output_dir(artist, title)
     )
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
