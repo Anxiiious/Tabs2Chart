@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from shred2chart.blend import blend_tracks
 from shred2chart.chart_writer import add_lead_in, build_chart
-from shred2chart.mapper import CHART_RESOLUTION, IR_TICKS_PER_QUARTER, ChartNote, map_notes
+from shred2chart.mapper import (
+    CHART_RESOLUTION,
+    IR_TICKS_PER_QUARTER,
+    ChartNote,
+    _assign_lanes,
+    _LaneContour,
+    map_notes,
+)
 
 IR_QUARTER = 960  # IR ticks per quarter note
 
@@ -51,10 +58,14 @@ class TestBlend:
 
 
 class TestMapper:
-    def test_tick_conversion_and_lane_mod(self):
+    def test_tick_conversion_and_first_note_anchors(self):
+        # First note still seeds the anchor from absolute pitch (pitch % 5),
+        # matching the old baseline for exactly one note; the second note's
+        # lane is RELATIVE to that anchor, not its own absolute pitch % 5.
         notes = map_notes([_note(0, pitch=62, fret=5), _note(960, pitch=63, fret=6)])
         assert notes[0].tick == 0 and notes[0].lanes == [62 % 5]
-        assert notes[1].tick == CHART_RESOLUTION and notes[1].lanes == [63 % 5]
+        assert notes[1].tick == CHART_RESOLUTION
+        assert notes[1].lanes == [(62 % 5) + 1]  # +1 semitone, in-box step, anchor unmoved
 
     def test_open_chug_on_lowest_string(self):
         # String 1 tuned to pitch 36 (fret 0), string 2 higher.
@@ -100,6 +111,103 @@ class TestMapper:
         assert notes[0].forced is True and notes[0].tap is False
         assert notes[1].tap is True
         assert notes[0].sustain == 0  # sixteenth note -> below sustain threshold
+
+
+class TestLaneContour:
+    """M4 contour mapping: _assign_lanes(group, chug_string, contour) with a
+    threshold-based static anchor (see mapper.py module docstring)."""
+
+    def _single(self, pitch, fret=5):
+        return [{"pitch": pitch, "fret": fret, "string": 1}]
+
+    def test_notes_within_one_hand_position_stay_one_step_from_anchor(self):
+        # Anchor at 60 (lane 0). Every later note in this test is within the
+        # 4-semitone box, so the anchor is static and each note's lane is a
+        # PURE function of (anchor_lane, direction from anchor) - not an
+        # incremental walk. Same direction from the same anchor -> same lane,
+        # which is exactly what gives pattern stability its guarantee.
+        contour = _LaneContour()
+        lanes = [
+            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 62, 64)
+        ]
+        assert lanes == [0, 1, 1]  # 62 and 64 are both "+1 from the static anchor"
+        assert contour.anchor_pitch == 60  # anchor never moved
+
+    def test_ascending_run_crossing_hand_positions_is_monotonic(self):
+        # A run that actually crosses hand-position boundaries (leaps > 4
+        # semitones each step) re-centers the anchor each time and climbs
+        # one lane per leap - this IS the case that should read as "going up."
+        contour = _LaneContour()
+        lanes = [
+            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 67, 74, 81)
+        ]
+        assert lanes == [0, 1, 2, 3]
+        assert contour.anchor_pitch == 81  # re-centered on every leap
+
+    def test_descending_run_clamps_at_zero(self):
+        contour = _LaneContour()
+        contour.anchor_pitch, contour.anchor_lane = 60, 0
+        lanes = [
+            _assign_lanes(self._single(p), None, contour)[0] for p in (58, 56, 54)
+        ]
+        assert lanes == [0, 0, 0]  # clamped: can't go below lane 0
+
+    def test_repeated_pitch_stays_on_same_lane(self):
+        contour = _LaneContour()
+        first = _assign_lanes(self._single(60), None, contour)[0]
+        second = _assign_lanes(self._single(60), None, contour)[0]
+        assert first == second
+
+    def test_pattern_stability_same_riff_maps_identically(self):
+        # A short riff within one hand-position box (anchor+0/+2/+4), played
+        # twice in a row through the same contour, must produce identical
+        # lanes both times - proof the anchor is static, not drifting.
+        contour = _LaneContour()
+        riff = [60, 62, 64, 60, 62, 64]
+        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in riff]
+        assert lanes[0:3] == lanes[3:6]
+        assert contour.anchor_pitch == 60  # never moved - all deltas were <=4
+
+    def test_in_box_move_does_not_recenter_anchor(self):
+        contour = _LaneContour()
+        _assign_lanes(self._single(60), None, contour)
+        _assign_lanes(self._single(64), None, contour)  # delta=4, inclusive boundary
+        assert contour.anchor_pitch == 60
+
+    def test_leap_beyond_hand_position_recenters_anchor(self):
+        contour = _LaneContour()
+        _assign_lanes(self._single(60), None, contour)  # anchor=60, lane=0
+        lane = _assign_lanes(self._single(72), None, contour)[0]  # delta=12
+        assert contour.anchor_pitch == 72  # re-centered on the new pitch
+        assert lane == 1  # one step from where the anchor's lane just was
+
+    def test_open_note_bypasses_contour_and_does_not_touch_anchor(self):
+        contour = _LaneContour()
+        _assign_lanes(self._single(60), None, contour)
+        group = [{"pitch": 36, "fret": 0, "string": 1}]
+        assert _assign_lanes(group, chug_string=1, contour=contour) == [7]
+        assert contour.anchor_pitch == 60  # untouched by the open note
+
+
+class TestChordDisjoint:
+    def _chord(self, pitches):
+        return [{"pitch": p, "string": i + 1, "fret": 5} for i, p in enumerate(pitches)]
+
+    def test_close_chord_stays_contiguous(self):
+        # Matches test_chord_lanes_adjacent_max_three_wide's real spacing.
+        contour = _LaneContour()
+        lanes = _assign_lanes(self._chord([40, 47, 52]), None, contour)
+        assert lanes == list(range(lanes[0], lanes[0] + 3))
+
+    def test_exactly_one_octave_apart_is_not_disjoint(self):
+        contour = _LaneContour()
+        lanes = _assign_lanes(self._chord([40, 52]), None, contour)  # gap == 12
+        assert lanes[1] - lanes[0] == 1  # still adjacent, not gapped
+
+    def test_more_than_one_octave_apart_is_disjoint(self):
+        contour = _LaneContour()
+        lanes = _assign_lanes(self._chord([40, 53]), None, contour)  # gap == 13
+        assert lanes[1] - lanes[0] == 2  # one empty lane between them
 
 
 class TestChartWriter:

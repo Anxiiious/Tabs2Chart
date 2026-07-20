@@ -1,9 +1,15 @@
-"""IR notes -> Clone Hero 5-lane note events (Stage 4, naive M3 version).
+"""IR notes -> Clone Hero 5-lane note events (Stage 4, M4 contour mapping).
 
-This is deliberately the game plan's M3 "emitter skeleton" mapping —
-pitch mod 5, no contour logic — plus the three cheap rules that matter
-most for playability in the target repertoire:
-
+- **Single notes use a threshold-based static-anchor contour** (see
+  `_LaneContour`/`_assign_lanes`): lanes move *relative* to a hand-position
+  anchor rather than from absolute pitch, so a melody reads as a smooth
+  up/down contour instead of jumping around whenever pitch-mod-5 happens
+  to land far away. The anchor stays fixed while the melody moves within
+  one hand position (a real guitarist doesn't shift position for every
+  note), and re-centers only on a genuine position-shift-sized leap. This
+  also gives pattern stability: the same riff played twice in the same
+  fret position maps to the identical lane sequence both times, since the
+  anchor isn't drifting note-to-note.
 - **Ties merge into sustains** (the EOF-confirmed behavior): a note with
   `tied: True` extends the previous note at the same string+pitch
   instead of becoming a new attack.
@@ -14,11 +20,12 @@ most for playability in the target repertoire:
 - **Technique flags**: hammer_on/pull_off -> forced flip (`N 5`),
   tap -> tap modifier (`N 6`, which overrides HOPO per the spec).
 
-Chord voicing is also naive: root lane from the root pitch, remaining
-chord notes stacked on adjacent lanes, capped at 3 lanes wide (game
-plan rule 3's cap, without the interval-spread subtlety).
-
-The real contour-based mapping is M4 and replaces `_assign_lanes`.
+Chord voicing: root lane from the root pitch, remaining chord notes
+stacked on adjacent lanes, capped at 3 lanes wide (game plan rule 3's
+cap) — except a "disjoint" voicing (widely separated pitches, > 1 octave
+apart, e.g. a two-hand tapped octave) leaves a gap between lanes instead
+of stacking them contiguous, per the same rationale as the single-note
+contour: adjacent lanes should mean "these pitches are close together."
 
 Tick conversion: IR is 960 ticks/quarter (PyGuitarPro convention),
 .chart is emitted at Resolution=192, so every position/length divides
@@ -46,6 +53,28 @@ SUSTAIN_GAP = CHART_RESOLUTION // 8  # 1/32 note = 24
 OPEN_NOTE = 7
 FORCED_FLAG = 5
 TAP_FLAG = 6
+
+# A note within this many semitones of the anchor is considered "the same
+# hand position" (roughly a real guitarist's 4-5 fret span) - the anchor
+# doesn't move for it. Bigger jumps re-center the anchor on the new pitch.
+HAND_POSITION_SEMITONES = 4
+
+# Chord pitches (sorted) more than an octave apart get a lane gap instead
+# of stacking contiguous - adjacent lanes should mean "close together."
+DISJOINT_CHORD_SEMITONES = 12
+
+
+class _LaneContour:
+    """Tracks the single-note lane-contour state across a `map_notes` run.
+
+    `anchor_pitch`/`anchor_lane` model where a guitarist's hand currently
+    sits on the neck. Both start `None` and are set by the first fretted
+    note encountered.
+    """
+
+    def __init__(self) -> None:
+        self.anchor_pitch: int | None = None
+        self.anchor_lane: int | None = None
 
 
 @dataclass
@@ -104,18 +133,48 @@ def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
     return min(tunings, key=tunings.get)
 
 
-def _assign_lanes(group: list[dict[str, Any]], chug_string: int | None) -> list[int]:
-    """Naive M3 lane assignment for one beat's notes (single or chord)."""
+def _assign_lanes(
+    group: list[dict[str, Any]], chug_string: int | None, contour: _LaneContour
+) -> list[int]:
+    """M4 lane assignment for one beat's notes (single or chord)."""
     if len(group) == 1:
         note = group[0]
         if note["fret"] == 0 and note["string"] == chug_string:
             return [OPEN_NOTE]
-        return [(note["pitch"] or 0) % 5]
+
+        pitch = note["pitch"] or 0
+        if contour.anchor_pitch is None:
+            contour.anchor_pitch = pitch
+            contour.anchor_lane = pitch % 5
+            return [contour.anchor_lane]
+
+        delta = pitch - contour.anchor_pitch
+        if abs(delta) > HAND_POSITION_SEMITONES:
+            # Position shift: re-center the anchor one step from where it
+            # was, then the new pitch is "at" the (now current) anchor.
+            step = 1 if delta > 0 else -1
+            contour.anchor_pitch = pitch
+            contour.anchor_lane = max(0, min(4, contour.anchor_lane + step))
+            return [contour.anchor_lane]
+
+        # Within one hand position: lane is a pure function of the STATIC
+        # anchor, not incremental from the last note - this is what makes
+        # the same riff in the same position map identically every time.
+        step = 0 if delta == 0 else (1 if delta > 0 else -1)
+        return [max(0, min(4, contour.anchor_lane + step))]
 
     pitches = sorted({n["pitch"] or 0 for n in group})
     width = min(len(pitches), 3)
     base = pitches[0] % (5 - (width - 1))  # keep the whole stack on the neck
-    return [base + i for i in range(width)]
+
+    lanes = [base]
+    lane = base
+    for i in range(1, width):
+        gap = pitches[i] - pitches[i - 1]
+        step = 2 if gap > DISJOINT_CHORD_SEMITONES else 1
+        lane = min(4, lane + step)
+        lanes.append(lane)
+    return lanes
 
 
 def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
@@ -129,9 +188,10 @@ def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
     for note in notes:
         groups.setdefault((note["tick"], note.get("chord_id")), []).append(note)
 
+    contour = _LaneContour()
     chart_notes: list[ChartNote] = []
     for (tick, _), group in sorted(groups.items(), key=lambda kv: kv[0][0]):
-        lanes = _assign_lanes(group, chug_string)
+        lanes = _assign_lanes(group, chug_string, contour)
         duration = max(n["duration_ticks"] for n in group)
         chart_notes.append(
             ChartNote(
