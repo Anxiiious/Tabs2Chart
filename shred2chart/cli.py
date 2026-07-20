@@ -153,9 +153,6 @@ def _prompt_convert_options(
         if unknown:
             print(f"Unknown track(s): {', '.join(map(str, unknown))}")
             continue
-        if not selected_ids:
-            print("Select at least one track.")
-            continue
         break
 
     default_out = Path(args.out) if args.out else _default_output_dir(artist, title)
@@ -167,7 +164,7 @@ def _prompt_convert_options(
             print("Cancelled; no files were written.")
             return None
 
-    print("The chart will use song.ogg in the output folder.")
+    print("Provide an audio file named song.ogg in the output folder before playing.")
     print("Use --offset-ms if the chart needs audio-sync adjustment later.")
     return selected_ids, out_dir
 

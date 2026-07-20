@@ -28,7 +28,13 @@ def test_interactive_prompt_allows_track_and_output_selection(monkeypatch, tmp_p
 
 def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_path):
     answers = iter(["bad", "9", "", str(tmp_path / "output")])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", answer)
     args = Namespace(out=None)
 
     result = _prompt_convert_options(
@@ -41,6 +47,7 @@ def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_pat
     )
 
     assert result == ([1, 0], tmp_path / "output")
+    assert len(prompts) == 4
 
 
 def test_interactive_prompt_can_cancel_overwrite(monkeypatch, tmp_path):
