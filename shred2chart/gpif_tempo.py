@@ -53,45 +53,82 @@ def _alternate_ending(master_bar: ET.Element) -> int | None:
     return int(el.text.strip())
 
 
+def _direction(master_bar: ET.Element) -> tuple[str | None, str | None]:
+    """A bar's (<Target>, <Jump>) from <Directions>, e.g. ("Segno", None) or
+    (None, "DaCoda"). Confirmed against 5 real Sheet Happens tabs, all using
+    exactly Target=Segno/Coda and Jump=DaCoda/DaSegnoAlCoda — GP's other
+    direction words (DaCapo*, Fine, ToCoda) are unconfirmed and rejected."""
+    directions_el = master_bar.find("Directions")
+    if directions_el is None:
+        return None, None
+    target = directions_el.findtext("Target")
+    jump = directions_el.findtext("Jump")
+    known_targets = {"Segno", "Coda", None}
+    known_jumps = {"DaCoda", "DaSegnoAlCoda", None}
+    if target not in known_targets or jump not in known_jumps:
+        raise GpifFormatError(
+            f"unrecognized <Directions> Target={target!r} Jump={jump!r} "
+            "(only Segno/Coda targets and DaCoda/DaSegnoAlCoda jumps are confirmed)"
+        )
+    return target, jump
+
+
 def compute_playback_order(root: ET.Element) -> list[int]:
     """Return file-order <MasterBar> indices in *performance* order.
 
     Guitar Pro stores bars in written (score) order but plays them in
-    performance order: bars inside repeat barlines play N times, and
-    1st/2nd endings are taken conditionally. Charts built from written
-    order drift progressively out of sync with the recording, since a
-    section written once but played twice occupies half the audio time it
-    should. This walks the score simulating GP's repeat playback so the
-    tick grid downstream reflects what's actually heard.
+    performance order: bars inside repeat barlines play N times, 1st/2nd
+    endings are taken conditionally, and D.S. al Coda directions jump
+    around. Charts built from written order drift progressively out of
+    sync with the recording, since a section written once but played
+    twice (or skipped, or replayed via a D.S. jump) occupies the wrong
+    share of the audio's time. This walks the score simulating GP's
+    playback so the tick grid downstream reflects what's actually heard.
 
-    Scope: <Repeat> barlines and <AlternateEndings> (1st/2nd endings).
-    <Directions> jumps (D.S./D.C./Coda) are a separate navigation layer
-    not handled yet — see SHRED2CHART_GAMEPLAN.md; this is the extension
-    point for them.
+    Scope: <Repeat> barlines, <AlternateEndings> (1st/2nd endings), and
+    D.S. al Coda navigation (<Directions> Target=Segno/Coda, Jump=DaCoda/
+    DaSegnoAlCoda) — confirmed against 5 real files that all use exactly
+    this one-Segno-one-Coda shape. Other direction words (D.C., Fine,
+    nested Codas) are unconfirmed and raise GpifFormatError rather than
+    being silently mishandled.
     """
     master_bars = root.findall("./MasterBars/MasterBar")
     if not master_bars:
         raise GpifFormatError("no <MasterBars><MasterBar> elements found")
 
-    # Precompute, per file-order bar: its repeat flags/count and alt-ending.
+    # Precompute, per file-order bar: its repeat flags/count, alt-ending,
+    # and D.S./Coda direction markers.
     repeats = []
+    directions = []
     for mb in master_bars:
         rep = mb.find("Repeat")
         start = rep is not None and rep.get("start") == "true"
         end = rep is not None and rep.get("end") == "true"
         count = int(rep.get("count", "2")) if rep is not None else 0
         repeats.append((start, end, count, _alternate_ending(mb)))
+        directions.append(_direction(mb))
+
+    # Segno/Coda targets must be known before the walk starts: a D.S. jump can
+    # (and in practice does) fire before the walk has ever passed the Coda
+    # bar in written order, so discovering them lazily during traversal would
+    # wrongly treat a not-yet-visited Coda as missing.
+    segno_bar = next((i for i, (t, _) in enumerate(directions) if t == "Segno"), None)
+    coda_bar = next((i for i, (t, _) in enumerate(directions) if t == "Coda"), None)
 
     order: list[int] = []
-    loop_back: int | None = None  # active span's repeat-start bar, or None
-    pass_num = 1                  # which pass through the active span we're on
-    # Loose upper bound on emitted bars, to catch malformed repeats instead
-    # of looping forever: every bar, times the largest repeat count, plus slack.
-    max_bars = len(master_bars) * (max((r[2] for r in repeats), default=1) + 1) + 1
+    loop_back: int | None = None  # active repeat span's start bar, or None
+    pass_num = 1                  # which pass through the active repeat span we're on
+    used_dsalcoda = False  # the D.S. al Coda jump fires at most once
+    used_dacoda = False    # the jump-to-Coda fires at most once, and only after the D.S.
+    # Loose upper bound on emitted bars: every bar, times the largest repeat
+    # count, times 2 for the extra full pass a D.S. jump can add, plus slack.
+    max_bars = len(master_bars) * (max((r[2] for r in repeats), default=1) + 1) * 2 + 1
 
     i = 0
     while i < len(master_bars):
         start, end, count, alt = repeats[i]
+        target, jump = directions[i]
+
         # A repeat-start opens a new span. Only treat it as fresh when we're not
         # already looping within it (loop_back == i means we jumped back here,
         # which must NOT reset the pass counter or the loop never terminates).
@@ -106,7 +143,7 @@ def compute_playback_order(root: ET.Element) -> list[int]:
 
         order.append(i)
         if len(order) > max_bars:
-            raise GpifFormatError("repeat expansion exceeded bar cap (malformed repeats?)")
+            raise GpifFormatError("repeat/navigation expansion exceeded bar cap (malformed file?)")
 
         if end and pass_num < count:
             if loop_back is None:  # repeat-end with no matching start
@@ -117,6 +154,24 @@ def compute_playback_order(root: ET.Element) -> list[int]:
 
         if end:
             loop_back = None  # span fully consumed; next start opens a fresh one
+
+        # DaCoda only triggers on the return trip, after the D.S. jump has
+        # already fired once — on the first pass it's just a normal bar (in
+        # Still Searching, play continues on to the D.S. jump further ahead).
+        if jump == "DaCoda" and used_dsalcoda and not used_dacoda:
+            if coda_bar is None:
+                raise GpifFormatError(f"Jump=DaCoda at bar {i} has no Target=Coda in the file")
+            used_dacoda = True
+            i = coda_bar
+            continue
+
+        if jump == "DaSegnoAlCoda" and not used_dsalcoda:
+            if segno_bar is None:
+                raise GpifFormatError(f"Jump=DaSegnoAlCoda at bar {i} has no Target=Segno in the file")
+            used_dsalcoda = True
+            i = segno_bar
+            continue
+
         i += 1
 
     return order

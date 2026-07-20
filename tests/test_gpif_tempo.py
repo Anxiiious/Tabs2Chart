@@ -102,8 +102,9 @@ def test_tempo_change_at_start_of_second_bar():
 # here matches the real "07 Still Searching GP.gp" (Senses Fail) file.
 
 
-def _rbar(*, time=None, repeat=None, alt=None, section=None):
-    """A <MasterBar> with optional Time, Repeat, AlternateEndings, Section.
+def _rbar(*, time=None, repeat=None, alt=None, section=None, target=None, jump=None):
+    """A <MasterBar> with optional Time, Repeat, AlternateEndings, Section,
+    and Directions (target="Segno"/"Coda", jump="DaCoda"/"DaSegnoAlCoda").
 
     `repeat` is (start, end, count) with start/end as bools.
     """
@@ -119,6 +120,13 @@ def _rbar(*, time=None, repeat=None, alt=None, section=None):
         parts.append(f"<AlternateEndings>{alt}</AlternateEndings>")
     if section is not None:
         parts.append(f"<Section><Text><![CDATA[{section}]]></Text></Section>")
+    if target is not None or jump is not None:
+        directions = []
+        if target is not None:
+            directions.append(f"<Target>{target}</Target>")
+        if jump is not None:
+            directions.append(f"<Jump>{jump}</Jump>")
+        parts.append(f"<Directions>{''.join(directions)}</Directions>")
     parts.append("<Bars>0</Bars>")
     return f"<MasterBar>{''.join(parts)}</MasterBar>"
 
@@ -206,3 +214,107 @@ def test_tempo_inside_repeat_reapplies_each_pass():
         {"tick": 0, "type": "tempo", "bpm": 123},
         {"tick": one_bar, "type": "tempo", "bpm": 123},
     ]
+
+
+# --- D.S. al Coda navigation -------------------------------------------------
+#
+# Confirmed against 5 real Sheet Happens tabs (Still Searching, Shark Attack,
+# etc.), all using exactly Target=Segno/Coda + Jump=DaCoda/DaSegnoAlCoda, one
+# of each per file. Bar shape below mirrors the real file's layout: Segno(0),
+# body(1), DaCoda(2), between-material(3), DaSegnoAlCoda(4), Coda(5), tail(6).
+
+
+def _ds_bars(extra_at=None, extra_kwargs=None):
+    """The standard 7-bar D.S. al Coda shape, with optional extra markup
+    (repeat/alt) merged onto one bar by index, for the overlap tests."""
+    kwargs_by_bar = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6: {}}
+    if extra_at is not None:
+        kwargs_by_bar[extra_at].update(extra_kwargs)
+    bars = [
+        _rbar(time="4/4", target="Segno", **kwargs_by_bar[0]),
+        _rbar(**kwargs_by_bar[1]),
+        _rbar(jump="DaCoda", **kwargs_by_bar[2]),
+        _rbar(**kwargs_by_bar[3]),
+        _rbar(jump="DaSegnoAlCoda", **kwargs_by_bar[4]),
+        _rbar(target="Coda", **kwargs_by_bar[5]),
+        _rbar(**kwargs_by_bar[6]),
+    ]
+    return bars
+
+
+def test_plain_da_segno_al_coda():
+    # First pass: 0,1,2,3,4 (DaCoda at 2 does NOT fire yet) -> D.S. jumps to 0.
+    # Second pass: 0,1,2 -> DaCoda now fires -> jumps to Coda: 5,6.
+    assert _order(_ds_bars()) == [0, 1, 2, 3, 4, 0, 1, 2, 5, 6]
+
+
+def test_da_coda_does_not_fire_on_first_pass():
+    # Regression guard: bar 3 (between DaCoda and DaSegnoAlCoda) and bar 4
+    # itself must appear on the first pass — proof DaCoda didn't short-circuit
+    # the trip to the D.S. jump.
+    order = _order(_ds_bars())
+    first_pass = order[:5]
+    assert first_pass == [0, 1, 2, 3, 4]
+
+
+def test_da_segno_al_coda_with_no_segno_raises():
+    bars = [_rbar(time="4/4"), _rbar(jump="DaSegnoAlCoda")]
+    with pytest.raises(GpifFormatError):
+        _order(bars)
+
+
+def test_da_coda_with_no_coda_raises():
+    # DaCoda only raises once it actually tries to fire (after the D.S. jump),
+    # so this needs a real Segno/DaSegnoAlCoda pair with no Target=Coda.
+    bars = [
+        _rbar(time="4/4", target="Segno"),
+        _rbar(jump="DaCoda"),
+        _rbar(jump="DaSegnoAlCoda"),
+    ]
+    with pytest.raises(GpifFormatError):
+        _order(bars)
+
+
+def test_unrecognized_direction_word_raises():
+    # D.C./Fine/etc. are unconfirmed against a real file - reject cleanly
+    # rather than silently mis-navigating.
+    bars = [_rbar(time="4/4", target="Fine")]
+    with pytest.raises(GpifFormatError):
+        _order(bars)
+
+
+def test_segno_bar_can_also_be_a_repeat_start():
+    # Mirrors "06 Shark Attack GP.gp" bar 3: Repeat(start=true) + Target=Segno
+    # on the same bar. The repeat still runs its own count independently of
+    # the D.S. logic, and re-runs again on the post-D.S. pass since the D.S.
+    # jump re-enters bar 0 from scratch.
+    bars = _ds_bars(extra_at=0, extra_kwargs={"repeat": (True, False, 2)})
+    bars[1] = _rbar(repeat=(False, True, 2))  # bar 1 closes the (0,1) repeat span
+    order = _order(bars)
+    assert order == [0, 1, 0, 1, 2, 3, 4, 0, 1, 0, 1, 2, 5, 6]
+
+
+def test_da_coda_bar_can_also_be_second_ending():
+    # Mirrors "06 Shark Attack GP.gp" bar 10: AlternateEndings=2 + Jump=DaCoda
+    # on the same bar, nested inside its own repeat. The alt-ending skip on
+    # pass 1 and the DaCoda-jump-on-return-trip logic must not interfere.
+    bars = [
+        _rbar(time="4/4", target="Segno"),
+        _rbar(repeat=(True, False, 2)),
+        _rbar(repeat=(False, True, 2), alt=1),
+        _rbar(alt=2, jump="DaCoda"),
+        _rbar(jump="DaSegnoAlCoda"),
+        _rbar(target="Coda"),
+        _rbar(),
+    ]
+    order = _order(bars)
+    # First D.S. pass: 0, then repeat(1,2) takes 1st ending (bar 2) on its
+    # first pass, loops, takes 2nd ending (bar 3, skipping bar 2) on its
+    # second pass, then bar 4 (DaSegnoAlCoda) jumps back to Segno (bar 0).
+    # Second D.S. pass: 0, then the SAME repeat span runs again from a fresh
+    # pass_num=1 (D.S. re-enters bar 0 from scratch) — but a repeat always
+    # takes its 1st ending on pass 1, so bar 2 is skipped only once count is
+    # exhausted; here bar 3 (2nd ending) also carries DaCoda, so as soon as
+    # this second D.S. pass reaches it, DaCoda fires and jumps to Coda (bar
+    # 5), skipping bar 4/the D.S. jump entirely on this trip.
+    assert order == [0, 1, 2, 1, 3, 4, 0, 1, 3, 5, 6]
