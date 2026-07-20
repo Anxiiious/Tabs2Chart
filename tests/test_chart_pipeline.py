@@ -254,6 +254,28 @@ class TestLaneContour:
         assert lanes == [4, 4, 3, 4, 4, 3, 3, 4, 0, 3, 3, 2, 3, 3]
         assert len(set(lanes[:8])) > 1, f"first 8 notes stuck on one lane: {lanes[:8]}"
 
+    def test_hammer_on_never_repeats_the_previous_lane(self):
+        # Regression guard for a real bug found by playtest: a hammer-on/
+        # pull-off always frets a different note than the one before it,
+        # so it can never land on the SAME lane as its predecessor - that
+        # would read as "hammer onto the same button," not a real guitar
+        # move. But the proportional contour can round two distinct
+        # pitches into the same lane bucket: with a static anchor at 69,
+        # pitch 71 (delta=2, round(2/3)=1) and pitch 73 (delta=4,
+        # round(4/3)=1) both land on lane 3 - confirmed as a real
+        # consecutive-HOPO collision at tick 84000 of "Still Searching"
+        # track 1 (71->73, both hammer_on/pull_off flagged). map_notes must
+        # nudge the second note off the collision, toward the direction
+        # its pitch actually moved.
+        notes = [
+            _note(0, pitch=69),
+            _note(960, pitch=71, hammer_on=True),
+            _note(1920, pitch=73, hammer_on=True),
+        ]
+        chart_notes = map_notes(notes)
+        assert len(chart_notes) == 3
+        assert chart_notes[1].lanes != chart_notes[2].lanes
+
 
 class TestChordDisjoint:
     def _chord(self, pitches):
