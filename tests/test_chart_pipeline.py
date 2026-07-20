@@ -7,8 +7,9 @@ from shred2chart.mapper import (
     CHART_RESOLUTION,
     IR_TICKS_PER_QUARTER,
     ChartNote,
-    _assign_lanes,
-    _LaneContour,
+    _chord_lanes_sequence,
+    _group_into_hand_positions,
+    _single_note_lanes,
     map_notes,
 )
 
@@ -59,10 +60,11 @@ class TestBlend:
 
 class TestMapper:
     def test_tick_conversion_and_first_note_anchors(self):
-        # The first note seeds the anchor at the centered lane (2),
-        # regardless of its absolute pitch (62 % 5 also happens to be 2,
-        # but that's coincidence, not the mechanism - see _assign_lanes).
-        # The second note's lane is RELATIVE to that anchor.
+        # The first hand-position group seeds centered (lane 2), regardless
+        # of absolute pitch (62 % 5 also happens to be 2, but that's
+        # coincidence, not the mechanism - see _single_note_lanes). The
+        # second note joins the same group (delta=1, within HAND_POSITION_
+        # SEMITONES) and rank-orders above it since it's the higher pitch.
         notes = map_notes([_note(0, pitch=62, fret=5), _note(960, pitch=63, fret=6)])
         assert notes[0].tick == 0 and notes[0].lanes == [2]
         assert notes[1].tick == CHART_RESOLUTION
@@ -114,217 +116,144 @@ class TestMapper:
         assert notes[0].sustain == 0  # sixteenth note -> below sustain threshold
 
 
-class TestLaneContour:
-    """M4 contour mapping: _assign_lanes(group, chug_string, contour) with a
-    threshold-based static anchor (see mapper.py module docstring)."""
+class TestHandPositionGrouping:
+    """_group_into_hand_positions: splits a pitch sequence into runs where
+    every note stays within HAND_POSITION_SEMITONES of the run's first
+    pitch (see mapper.py module docstring)."""
 
-    def _single(self, pitch, fret=5):
-        return [{"pitch": pitch, "fret": fret, "string": 1}]
+    def test_notes_within_one_hand_position_form_one_group(self):
+        assert _group_into_hand_positions([60, 62, 64]) == [[60, 62, 64]]
 
-    def test_notes_within_one_hand_position_stay_one_step_from_anchor(self):
-        # Anchor at 60 seeds to the MIDDLE lane (2) regardless of absolute
-        # pitch - see _assign_lanes: an edge seed leaves no headroom in one
-        # direction and clamps nearby notes into a wall (the real "section
-        # [D]" bug this centered seed fixes). Every later note in this test
-        # is within the 4-semitone box, so the anchor is static and each
-        # note's lane is a PURE function of (anchor_lane, direction from
-        # anchor) - not an incremental walk. Same direction from the same
-        # anchor -> same lane, which is exactly what gives pattern
-        # stability its guarantee.
-        contour = _LaneContour()
-        lanes = [
-            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 62, 64)
-        ]
-        assert lanes == [2, 3, 3]  # seeded at 2; 62 and 64 are both "+1 from anchor"
-        assert contour.anchor_pitch == 60  # anchor never moved
+    def test_leap_beyond_hand_position_starts_a_new_group(self):
+        assert _group_into_hand_positions([60, 72]) == [[60], [72]]
 
-    def test_ascending_run_crossing_hand_positions_is_monotonic(self):
-        # A run that crosses hand-position boundaries (leaps > 4 semitones
-        # each step) re-centers the anchor EVERY step - and the anchor
-        # always re-centers back to CENTER_LANE (2), not the just-computed
-        # lane, so it has headroom again next time. Each +6 semitone leap
-        # is independently round(6/3)=2 lanes from that fresh center (2),
-        # landing this note at 2+2=4 every time.
-        contour = _LaneContour()
-        lanes = [
-            _assign_lanes(self._single(p), None, contour)[0] for p in (60, 66, 72, 78)
-        ]
-        assert lanes == [2, 4, 4, 4]
-        assert contour.anchor_pitch == 78  # re-centered on every leap
-        assert contour.anchor_lane == 2  # re-centers to CENTER_LANE, not the clamped 4
+    def test_boundary_delta_of_exactly_four_stays_in_one_group(self):
+        assert _group_into_hand_positions([60, 64]) == [[60, 64]]
 
-    def test_descending_run_clamps_at_zero(self):
-        contour = _LaneContour()
-        contour.anchor_pitch, contour.anchor_lane = 60, 0
-        lanes = [
-            _assign_lanes(self._single(p), None, contour)[0] for p in (58, 56, 54)
-        ]
-        assert lanes == [0, 0, 0]  # clamped: can't go below lane 0
+    def test_empty_input_returns_no_groups(self):
+        assert _group_into_hand_positions([]) == []
 
-    def test_repeated_pitch_stays_on_same_lane(self):
-        contour = _LaneContour()
-        first = _assign_lanes(self._single(60), None, contour)[0]
-        second = _assign_lanes(self._single(60), None, contour)[0]
-        assert first == second
 
-    def test_pattern_stability_same_riff_maps_identically(self):
-        # A short riff within one hand-position box (anchor+0/+2/+4), played
-        # twice in a row through the same contour, must produce identical
-        # lanes both times - proof the anchor is static, not drifting.
-        contour = _LaneContour()
-        riff = [60, 62, 64, 60, 62, 64]
-        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in riff]
-        assert lanes[0:3] == lanes[3:6]
-        assert contour.anchor_pitch == 60  # never moved - all deltas were <=4
+class TestSingleNoteLanes:
+    """_single_note_lanes: rank-order-within-group + proportional leap
+    between groups + memoized exact repeats (see mapper.py module
+    docstring for the full design and why it replaced the v1-v5 static-
+    anchor contour)."""
 
-    def test_in_box_move_does_not_recenter_anchor(self):
-        contour = _LaneContour()
-        _assign_lanes(self._single(60), None, contour)
-        _assign_lanes(self._single(64), None, contour)  # delta=4, inclusive boundary
-        assert contour.anchor_pitch == 60
+    def test_first_group_seeds_centered(self):
+        lanes = _single_note_lanes([60])
+        assert lanes == [2]
 
-    def test_leap_beyond_hand_position_recenters_anchor(self):
-        contour = _LaneContour()
-        _assign_lanes(self._single(60), None, contour)  # anchor=60, lane=2 (centered seed)
-        lane = _assign_lanes(self._single(72), None, contour)[0]  # delta=12
-        assert contour.anchor_pitch == 72  # re-centered on the new pitch
-        # This note's own lane is proportional to the leap size (v2 fix:
-        # round(12/3)=4 lanes from the old anchor's lane, not a flat +-1).
-        assert lane == 4
-        # But the ANCHOR going forward re-centers to CENTER_LANE (2), not
-        # the edge value this note landed on - otherwise the next leap
-        # re-centers from an edge with no headroom, reproducing the same
-        # clamping-wall bug one leap later (confirmed on a real leap right
-        # before "Still Searching" section [D]).
-        assert contour.anchor_lane == 2
+    def test_distinct_pitches_in_one_group_get_distinct_rank_ordered_lanes(self):
+        # Ascending pitches within one hand position rank in the same
+        # order: lowest pitch gets the lowest lane of the spread.
+        lanes = _single_note_lanes([60, 62, 64])
+        assert lanes[0] < lanes[1] < lanes[2]
+        assert len(set(lanes)) == 3
 
-    def test_open_note_bypasses_contour_and_does_not_touch_anchor(self):
-        contour = _LaneContour()
-        _assign_lanes(self._single(60), None, contour)
-        group = [{"pitch": 36, "fret": 0, "string": 1}]
-        assert _assign_lanes(group, chug_string=1, contour=contour) == [7]
-        assert contour.anchor_pitch == 60  # untouched by the open note
+    def test_repeated_pitch_within_a_group_reuses_its_rank_lane(self):
+        lanes = _single_note_lanes([60, 62, 60, 62])
+        assert lanes[0] == lanes[2]
+        assert lanes[1] == lanes[3]
+
+    def test_leap_starts_a_new_group_centered_by_default(self):
+        lanes = _single_note_lanes([60, 72])
+        assert lanes[0] == 2  # first group, centered
+        # second group is a fresh single-pitch group; its target lane is
+        # a proportional leap (round(12/3)=4) from the centered anchor,
+        # clamped to [0, 4].
+        assert lanes[1] == 4
+
+    def test_exact_repeat_group_replays_the_first_occurrences_lanes(self):
+        # The core ask this design was built for: an identical riff
+        # recurring later (even after a totally different intervening
+        # passage) must map to the IDENTICAL lane sequence both times -
+        # confirmed necessary because real songs reprise earlier material
+        # across section boundaries (e.g. "Still Searching"'s [A'] section
+        # replays material from [C]/[D]/[E]), so per-section-only
+        # stability isn't enough.
+        riff = [60, 62, 64]
+        unrelated = [90, 91]  # a distant, unrelated passage in between
+        pitches = riff + unrelated + riff
+        lanes = _single_note_lanes(pitches)
+        assert lanes[0:3] == lanes[-3:]
+
+    def test_consecutive_distinct_pitches_never_share_a_lane(self):
+        # Regression guard, generalized from two real bugs found by
+        # playtest: (1) a hammer-on/pull-off landing on the same lane as
+        # the note before it reads as "hammer onto the same button,"
+        # which isn't a real guitar move; (2) a picked descending chug run
+        # (frets 7/5/4/5/4/2, "Still Searching" track 1 section [G]) also
+        # clustered notes onto one lane under the old proportional-step
+        # formula. Neither is HOPO-specific - the rule is general: no two
+        # ADJACENT single notes with different pitches may share a lane.
+        pitches = [52, 50, 49, 50, 49, 47]
+        lanes = _single_note_lanes(pitches)
+        for i in range(1, len(pitches)):
+            assert lanes[i] != lanes[i - 1], (
+                f"note {i} (pitch {pitches[i]}) repeated lane {lanes[i]} "
+                f"from note {i-1} (pitch {pitches[i-1]})"
+            )
 
     def test_real_lead_lick_regression_spreads_across_lanes(self):
         # Regression guard for the M4 v1 "stuck high" bug: a real wide-
         # ranging lead lick (Still Searching, track 1, ticks 92000-110880,
         # spanning 17 semitones) got jammed onto just 2 adjacent lanes
-        # under v1's flat +-1 step. The proportional formula must spread
-        # it across at least 3 distinct lanes.
+        # under v1's flat +-1 step.
         pitches = [
             68, 61, 73, 61, 69, 69, 61, 68, 66, 66, 61, 76, 78, 78, 76, 73, 61, 73,
             61, 69, 69, 61, 68, 66, 66, 73, 74, 76, 76, 74, 73, 69, 61, 73, 61, 69,
             69, 61, 68, 66,
         ]
-        contour = _LaneContour()
-        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in pitches]
+        lanes = _single_note_lanes(pitches)
         assert len(set(lanes)) >= 3, f"squashed to {sorted(set(lanes))}: {lanes}"
-        # Pitch 61 (the recurring low pedal tone) settles onto one lane
-        # once its own anchor is established - its very first occurrence
-        # is still relative to whatever anchor preceded it, but every
-        # occurrence after that should land on the same lane, not oscillate.
-        sixty_one_indices = [i for i, p in enumerate(pitches) if p == 61]
-        lanes_after_first_occurrence = [lanes[i] for i in sixty_one_indices[1:]]
-        assert len(set(lanes_after_first_occurrence)) == 1, (
-            f"61 landed on inconsistent lanes after settling: {lanes_after_first_occurrence}"
-        )
 
-    def test_real_section_d_regression_first_notes_not_stuck_at_edge(self):
-        # Regression guard for a real bug that showed up THREE times: once
-        # at the very first note of a track (fixed by seeding at
-        # CENTER_LANE instead of pitch % 5), again mid-song when an earlier
-        # leap happened to re-center the anchor onto an edge lane right
-        # before this exact passage (Still Searching, track 1, start of
-        # section [D], tick 76800+), and a third time even after the
-        # re-center-to-CENTER_LANE fix: an anchor already stuck at an edge
-        # (reproduced here by seeding anchor_pitch=69/anchor_lane=4) stayed
-        # stuck through a whole cluster of in-box notes (69/71/73), none of
-        # which was individually a big enough leap (>4 semitones from 69)
-        # to trigger the re-center. Error-leaking fixes this: an in-box
-        # move that clamps against the lane-4 wall (e.g. 69->73) shifts the
-        # anchor's reference lane down to absorb the hit, so the next
-        # in-box note has headroom instead of clamping again.
-        pitches = [69, 73, 69, 71, 71, 69, 69, 74, 69, 73, 73, 69, 71, 73]
-        contour = _LaneContour()
-        contour.anchor_pitch, contour.anchor_lane = 69, 4  # matches the real bug's state
-        lanes = [_assign_lanes(self._single(p), None, contour)[0] for p in pitches]
-        # Exact expected sequence, verified against the real fix's output:
-        # note 2 (73) clamps at the lane-4 wall and leaks the error into
-        # anchor_lane (4->3), which is what un-sticks every note after it.
-        assert lanes == [4, 4, 3, 4, 4, 3, 3, 4, 0, 3, 3, 2, 3, 3]
-        assert len(set(lanes[:8])) > 1, f"first 8 notes stuck on one lane: {lanes[:8]}"
-
-    def test_hammer_on_never_repeats_the_previous_lane(self):
-        # Regression guard for a real bug found by playtest: a hammer-on/
-        # pull-off always frets a different note than the one before it,
-        # so it can never land on the SAME lane as its predecessor - that
-        # would read as "hammer onto the same button," not a real guitar
-        # move. But the proportional contour can round two distinct
-        # pitches into the same lane bucket: with a static anchor at 69,
-        # pitch 71 (delta=2, round(2/3)=1) and pitch 73 (delta=4,
-        # round(4/3)=1) both land on lane 3 - confirmed as a real
-        # consecutive-HOPO collision at tick 84000 of "Still Searching"
-        # track 1 (71->73, both hammer_on/pull_off flagged). map_notes must
-        # nudge the second note off the collision, toward the direction
-        # its pitch actually moved.
-        notes = [
-            _note(0, pitch=69),
-            _note(960, pitch=71, hammer_on=True),
-            _note(1920, pitch=73, hammer_on=True),
-        ]
-        chart_notes = map_notes(notes)
-        assert len(chart_notes) == 3
-        assert chart_notes[1].lanes != chart_notes[2].lanes
-
-    def test_picked_descending_run_never_repeats_the_previous_lane(self):
-        # Generalization of the HOPO fix above: user playtest of v4 found
-        # a picked (non-HOPO) descending chug run also clustering onto one
-        # lane - "a section in G where it's a fast descending-ish
-        # powerchord chug, but it all hits the green lane consecutively."
-        # Real data: "Still Searching" track 1, tick 251520+, frets
-        # 7/5/4/5/4/2 on one string (pitches 52/50/49/50/49/47), none
-        # hammer_on/pull_off flagged. Anchored at 52: delta -2 (pitch 50)
-        # and delta -3 (pitch 49) both round to lane_delta=-1
-        # (SEMITONES_PER_LANE=3), landing both on lane 1 with no clamp
-        # error to trigger the error-leak - four genuinely different frets
-        # collapsed onto one button. The "never repeat the previous lane"
-        # rule must apply to ANY consecutive distinct-pitch single notes,
-        # not just forced ones.
-        notes = [
-            _note(0, pitch=52),
-            _note(960, pitch=50),
-            _note(1920, pitch=49),
-            _note(2880, pitch=50),
-            _note(3840, pitch=49),
-        ]
-        chart_notes = map_notes(notes)
-        assert len(chart_notes) == 5
-        for i in range(1, len(chart_notes)):
-            assert chart_notes[i].lanes != chart_notes[i - 1].lanes, (
-                f"note {i} (pitch {notes[i]['pitch']}) repeated lane "
-                f"{chart_notes[i].lanes} from note {i - 1} (pitch {notes[i-1]['pitch']})"
-            )
+    def test_real_section_g_regression_descending_run_spreads_out(self):
+        # Regression guard for the bug found by playtest after v4/v5: a
+        # descending single-string chug run (frets 7/5/4/5/4/2, pitches
+        # 52/50/49/50/49/47, "Still Searching" track 1 section [G]) still
+        # clustered onto just green/red under the old per-note
+        # proportional-distance formula, because deltas -2 and -3 both
+        # rounded to the same lane step. Rank-ordering the group's
+        # distinct pitches fixes this by construction.
+        pitches = [52, 50, 49, 50, 49, 47]
+        lanes = _single_note_lanes(pitches)
+        assert len(set(lanes)) >= 3, f"squashed to {sorted(set(lanes))}: {lanes}"
 
 
 class TestChordDisjoint:
-    def _chord(self, pitches):
-        return [{"pitch": p, "string": i + 1, "fret": 5} for i, p in enumerate(pitches)]
+    def _lanes(self, pitches):
+        return _chord_lanes_sequence([tuple(sorted(pitches))])[0]
 
     def test_close_chord_stays_contiguous(self):
         # Matches test_chord_lanes_adjacent_max_three_wide's real spacing.
-        contour = _LaneContour()
-        lanes = _assign_lanes(self._chord([40, 47, 52]), None, contour)
+        lanes = self._lanes([40, 47, 52])
         assert lanes == list(range(lanes[0], lanes[0] + 3))
 
     def test_exactly_one_octave_apart_is_not_disjoint(self):
-        contour = _LaneContour()
-        lanes = _assign_lanes(self._chord([40, 52]), None, contour)  # gap == 12
+        lanes = self._lanes([40, 52])  # gap == 12
         assert lanes[1] - lanes[0] == 1  # still adjacent, not gapped
 
     def test_more_than_one_octave_apart_is_disjoint(self):
-        contour = _LaneContour()
-        lanes = _assign_lanes(self._chord([40, 53]), None, contour)  # gap == 13
+        lanes = self._lanes([40, 53])  # gap == 13
         assert lanes[1] - lanes[0] == 2  # one empty lane between them
+
+    def test_repeated_chord_shape_reuses_its_lanes(self):
+        # Same repeat-stability guarantee as single notes: an identical
+        # chord shape recurring later must map to identical lanes.
+        lanes_seq = _chord_lanes_sequence([(54, 66), (57, 69), (54, 66)])
+        assert lanes_seq[0] == lanes_seq[2]
+
+    def test_small_root_shift_does_not_jump_the_whole_lane_range(self):
+        # Regression guard for a real bug found by playtest: the old
+        # absolute-pitch chord formula (root % N) jumped the FULL lane
+        # range for a small root shift - confirmed on "Still Searching"
+        # track 1, (59,71)->(56,68), a 3-semitone (minor 3rd) root
+        # movement that jumped [3,4]->[0,1]. The new anchor/leap design
+        # (same mechanism as single notes) should keep a small shift's
+        # lane movement small.
+        lanes_seq = _chord_lanes_sequence([(59, 71), (56, 68)])
+        assert abs(lanes_seq[1][0] - lanes_seq[0][0]) <= 2
 
 
 class TestChartWriter:
