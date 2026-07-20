@@ -127,6 +127,8 @@ def _prompt_convert_options(
     tracks: list[tuple[int, str]],
     track_ids: list[int],
     names: dict[int, str],
+    artist: str,
+    title: str,
 ) -> tuple[list[int], Path] | None:
     """Let an interactive user review track and output choices before writing."""
     print("\nInteractive conversion")
@@ -152,7 +154,7 @@ def _prompt_convert_options(
             continue
         break
 
-    default_out = Path(args.out) if args.out else Path(f"songs/{args.artist} - {args.title}")
+    default_out = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
     out_text = input(f"Output folder [{default_out}]: ").strip()
     out_dir = Path(out_text).expanduser() if out_text else default_out
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -205,9 +207,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     names = dict(tracks)
     if args.interactive:
-        args.artist = artist
-        args.title = title
-        interactive_options = _prompt_convert_options(args, tracks, track_ids, names)
+        interactive_options = _prompt_convert_options(args, tracks, track_ids, names, artist, title)
         if interactive_options is None:
             return 0
         track_ids, interactive_out = interactive_options

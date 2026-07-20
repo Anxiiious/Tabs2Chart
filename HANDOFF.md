@@ -94,7 +94,7 @@ It creates a folder `songs/Artist - Title/` with two files:
 
 - [x] Add an opt-in guided conversion workflow (`convert --interactive`)
 - [ ] Validate input files and report filesystem errors clearly
-- [ ] Protect existing output folders from accidental overwrites
+- [x] Protect existing output folders from accidental overwrites in guided mode
 - [ ] Make track selection consistent across inspection and conversion commands
 - [ ] Support conversion for all formats currently accepted by inspection commands
 - [ ] Add a `check`/`validate` command for generated charts
