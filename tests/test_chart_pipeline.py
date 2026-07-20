@@ -276,6 +276,35 @@ class TestLaneContour:
         assert len(chart_notes) == 3
         assert chart_notes[1].lanes != chart_notes[2].lanes
 
+    def test_picked_descending_run_never_repeats_the_previous_lane(self):
+        # Generalization of the HOPO fix above: user playtest of v4 found
+        # a picked (non-HOPO) descending chug run also clustering onto one
+        # lane - "a section in G where it's a fast descending-ish
+        # powerchord chug, but it all hits the green lane consecutively."
+        # Real data: "Still Searching" track 1, tick 251520+, frets
+        # 7/5/4/5/4/2 on one string (pitches 52/50/49/50/49/47), none
+        # hammer_on/pull_off flagged. Anchored at 52: delta -2 (pitch 50)
+        # and delta -3 (pitch 49) both round to lane_delta=-1
+        # (SEMITONES_PER_LANE=3), landing both on lane 1 with no clamp
+        # error to trigger the error-leak - four genuinely different frets
+        # collapsed onto one button. The "never repeat the previous lane"
+        # rule must apply to ANY consecutive distinct-pitch single notes,
+        # not just forced ones.
+        notes = [
+            _note(0, pitch=52),
+            _note(960, pitch=50),
+            _note(1920, pitch=49),
+            _note(2880, pitch=50),
+            _note(3840, pitch=49),
+        ]
+        chart_notes = map_notes(notes)
+        assert len(chart_notes) == 5
+        for i in range(1, len(chart_notes)):
+            assert chart_notes[i].lanes != chart_notes[i - 1].lanes, (
+                f"note {i} (pitch {notes[i]['pitch']}) repeated lane "
+                f"{chart_notes[i].lanes} from note {i - 1} (pitch {notes[i-1]['pitch']})"
+            )
+
 
 class TestChordDisjoint:
     def _chord(self, pitches):

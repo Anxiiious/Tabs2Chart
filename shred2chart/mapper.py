@@ -21,14 +21,16 @@
   in-box notes get headroom back instead of clamping against the same
   wall repeatedly - this is what rescues an anchor that's already stuck
   at an edge with no single note big enough to trigger a re-center.
-- **A hammer-on/pull-off never repeats the previous note's lane**
-  (post-pass in `map_notes`): the proportional contour can round two
-  distinct pitches into the same lane bucket (e.g. deltas 2 and 4 both
-  round to the same lane_delta at `SEMITONES_PER_LANE=3`), which is a
-  tolerable ambiguity for normal notes but nonsensical for a HOPO, since
-  hammering onto the same fret isn't a real guitar move. A collision is
-  nudged one lane in the direction the pitch actually moved (confirmed
-  against 4 real collisions in "Still Searching" track 1).
+- **Two consecutive single notes with different pitches never share a
+  lane** (post-pass in `map_notes`): the proportional contour can round
+  two distinct pitch deltas into the same lane bucket (e.g. deltas -2
+  and -3 both round to lane_delta=-1 at `SEMITONES_PER_LANE=3`, with no
+  clamp error to trigger the error-leak), which defeats the point of
+  contour mapping - the highway should visually track pitch movement,
+  whether the notes are hammered/pulled or picked. A collision is nudged
+  one lane in the direction the pitch actually moved (confirmed against
+  4 real HOPO collisions and a real picked descending chug run in "Still
+  Searching" track 1).
 - **Ties merge into sustains** (the EOF-confirmed behavior): a note with
   `tied: True` extends the previous note at the same string+pitch
   instead of becoming a new attack.
@@ -279,24 +281,31 @@ def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
             )
         )
 
-    # A hammer-on/pull-off always frets a different note than the one it
-    # follows, so it can never sit on the same lane as its predecessor -
-    # that would read as "hammer onto the same button," which isn't a real
-    # guitar move. The proportional contour above can still round two
-    # distinct pitches into the same lane bucket (e.g. deltas 2 and 4 both
-    # round to lane_delta=1 at SEMITONES_PER_LANE=3); nudge the collision
-    # away in the direction pitch actually moved, confirmed against 4 real
-    # collisions in "Still Searching" track 1 (e.g. 71->73 at tick 84000
-    # both landing on lane 3).
+    # Two consecutive single notes with genuinely different pitches must
+    # never land on the same lane - that defeats the whole point of
+    # contour mapping (the highway should visually track pitch movement),
+    # and for a hammer-on/pull-off specifically it reads as "hammer onto
+    # the same button," which isn't a real guitar move. The proportional
+    # contour above can still round two distinct pitch deltas into the
+    # same lane bucket (e.g. deltas -2 and -3 both round to lane_delta=-1
+    # at SEMITONES_PER_LANE=3, with no clamp error to trigger the
+    # error-leak since the landing lane is still in [0,4]); nudge the
+    # collision away in the direction pitch actually moved. Confirmed
+    # against real "Still Searching" track 1 data: 4 HOPO collisions (e.g.
+    # 71->73 at tick 84000, both landing on lane 3) and a picked
+    # descending chug run (52-50-49-50-49, tick 251520+) that clustered
+    # onto lane 1 for 4 notes despite every fret actually differing.
     for i in range(1, len(chart_notes)):
         prev, note = chart_notes[i - 1], chart_notes[i]
-        if not note.forced or len(note.lanes) != 1 or len(prev.lanes) != 1:
+        if len(note.lanes) != 1 or len(prev.lanes) != 1:
             continue
         if note.lanes != prev.lanes:
             continue
         prev_pitch = prev.source.get("pitch")
         pitch = note.source.get("pitch")
-        direction = 1 if (pitch or 0) >= (prev_pitch or 0) else -1
+        if pitch is None or prev_pitch is None or pitch == prev_pitch:
+            continue
+        direction = 1 if pitch > prev_pitch else -1
         nudged = note.lanes[0] + direction
         if not 0 <= nudged <= 4:
             nudged = note.lanes[0] - direction
