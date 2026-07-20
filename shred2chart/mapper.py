@@ -4,21 +4,22 @@ This is deliberately the game plan's M3 "emitter skeleton" mapping —
 pitch mod 5, no contour logic — plus the three cheap rules that matter
 most for playability in the target repertoire:
 
-- **Ties merge into sustains** (the EOF-confirmed behavior): a note with
-  `tied: True` extends the previous note at the same string+pitch
+- Ties merge into sustains (the EOF-confirmed behavior): a note with
+  tied: True extends the previous note at the same string+pitch
   instead of becoming a new attack.
-- **Open-string chugs -> open note (N 7)**: fret 0 on the track's
+- Open-string chugs -> open note (N 7): fret 0 on the track's
   lowest-tuned string. The tuning is inferred from the notes themselves
   (pitch - fret = the string's tuning), so drop tunings work without
   any tuning metadata.
-- **Technique flags**: hammer_on/pull_off -> forced flip (`N 5`),
-  tap -> tap modifier (`N 6`, which overrides HOPO per the spec).
+- Technique flags: hammer_on/pull_off -> forced flip (N 5),
+  tap -> tap modifier (N 6, which overrides HOPO per the spec).
 
-Chord voicing is also naive: root lane from the root pitch, remaining
-chord notes stacked on adjacent lanes, capped at 3 lanes wide (game
-plan rule 3's cap, without the interval-spread subtlety).
+Chord voicing: root lane from the root pitch, remaining chord notes
+spread by harmonic interval (see _interval_to_gap) rather than
+forced onto adjacent lanes, capped at 3 lanes wide (game plan rule
+3's cap).
 
-The real contour-based mapping is M4 and replaces `_assign_lanes`.
+The real contour-based mapping is M4 and replaces _assign_lanes.
 
 Tick conversion: IR is 960 ticks/quarter (PyGuitarPro convention),
 .chart is emitted at Resolution=192, so every position/length divides
@@ -104,8 +105,43 @@ def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
     return min(tunings, key=tunings.get)
 
 
-def _assign_lanes(group: list[dict[str, Any]], chug_string: int | None) -> list[int]:
-    """Naive M3 lane assignment for one beat's notes (single or chord)."""
+def _interval_to_gap(semitones: int) -> int:
+    """Map a chord interval (semitones) to a chart lane gap (1-4).
+
+    Tight intervals (m2/M2/m3/M3) stay on close lanes; wider ones
+    (P4/P5 — i.e. power chords) and beyond spread across skipped
+    lanes. Replaces the old always-adjacent (gap=1) rule.
+    """
+    semitones = abs(semitones) % 12
+    if semitones <= 4:   # m2, M2, m3, M3
+        return 1
+    if semitones <= 7:   # P4, P5 (power chords land here)
+        return 2
+    if semitones <= 9:   # m6, M6
+        return 3
+    return 4              # m7, M7, octave
+
+
+def _assign_lanes(
+    group: list[dict[str, Any]],
+    chug_string: int | None,
+    prev: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
+) -> list[int]:
+    """M3.2 lane assignment for one beat's notes (single or chord).
+
+    Chords are voiced by interval: lane gaps follow the actual
+    harmonic distance between successive notes (see
+    _interval_to_gap) rather than always being adjacent, so power
+    chords/5ths/octaves spread across skipped lanes (e.g. 0,2 or
+    1,3) instead of collapsing to 0,1.
+
+    Anti-repeat rule: if this chord's pitches differ from the
+    previous chord's but the naive anchoring would land on the exact
+    same lanes (root-mod collisions, e.g. C5 and Eb5 both anchoring
+    to base 0), nudge the base to the nearest free slot so the chart
+    visibly moves. Identical repeated chords (chugs) keep their lanes.
+    prev is (prev_pitches, prev_lanes) from the last chord.
+    """
     if len(group) == 1:
         note = group[0]
         if note["fret"] == 0 and note["string"] == chug_string:
@@ -114,8 +150,54 @@ def _assign_lanes(group: list[dict[str, Any]], chug_string: int | None) -> list[
 
     pitches = sorted({n["pitch"] or 0 for n in group})
     width = min(len(pitches), 3)
-    base = pitches[0] % (5 - (width - 1))  # keep the whole stack on the neck
-    return [base + i for i in range(width)]
+    root = pitches[0]
+
+    offsets = [0]
+    for prev_p, curr_p in zip(pitches[: width - 1], pitches[1:width]):
+        offsets.append(offsets[-1] + _interval_to_gap(curr_p - prev_p))
+
+    span = offsets[-1]
+    if span > 4:
+        # Wider than the 5-lane neck: pin the outer notes to the full
+        # width and clamp the middle inside, instead of float scaling.
+        # (Unreachable with the current gap table — max span is 8 and
+        # no reachable combo collides — but explicit beats clever if
+        # _interval_to_gap ever changes.)
+        if width == 2:
+            offsets = [0, 4]
+        else:
+            mid = max(1, min(3, round(offsets[1] * 4 / span)))
+            offsets = [0, mid, 4]
+        span = 4
+
+    n_bases = 4 - span + 1  # valid anchor positions on the neck
+    base = root % n_bases
+    lanes = sorted({base + o for o in offsets})
+
+    if prev is not None:
+        prev_pitches, prev_lanes = prev
+        if tuple(pitches) != prev_pitches and tuple(lanes) == prev_lanes:
+            if n_bases > 1:
+                # Different chord, identical lanes: shift to the nearest
+                # alternative anchor (prefer +1, wrap within range).
+                for delta in (1, -1, 2, -2, 3, -3, 4, -4):
+                    alt = base + delta
+                    if 0 <= alt < n_bases:
+                        lanes = sorted({alt + o for o in offsets})
+                        break
+            elif len(lanes) == 3:
+                # Full-width 3-note chord ([0, mid, 4]): the base can't
+                # move, so shift the middle note instead.
+                for alt_mid in (2, 1, 3):
+                    if alt_mid != lanes[1]:
+                        lanes = [0, alt_mid, 4]
+                        break
+            else:
+                # Full-width 2-note chord ([0, 4]): pull one end in a
+                # lane to distinguish it (still a wide skip shape).
+                lanes = [0, 3] if prev_lanes != (0, 3) else [1, 4]
+
+    return lanes
 
 
 def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
@@ -130,8 +212,14 @@ def map_notes(ir_notes: list[dict[str, Any]]) -> list[ChartNote]:
         groups.setdefault((note["tick"], note.get("chord_id")), []).append(note)
 
     chart_notes: list[ChartNote] = []
+    prev_chord: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     for (tick, _), group in sorted(groups.items(), key=lambda kv: kv[0][0]):
-        lanes = _assign_lanes(group, chug_string)
+        lanes = _assign_lanes(group, chug_string, prev=prev_chord)
+        if len(group) > 1 and lanes != [OPEN_NOTE]:
+            prev_chord = (
+                tuple(sorted({n["pitch"] or 0 for n in group})),
+                tuple(lanes),
+            )
         duration = max(n["duration_ticks"] for n in group)
         chart_notes.append(
             ChartNote(

@@ -23,7 +23,7 @@ def _note(tick, pitch=40, string=1, fret=0, duration=IR_QUARTER // 4, **flags):
 class TestBlend:
     def test_lead_wins_technique_heavy_section_rhythm_wins_busy_one(self):
         # Section 1 (ticks 0-3840): rhythm has 4 plain notes, lead has 2
-        # tapped notes (2 + 2*2*2 = wait: 2 notes + 2 flags * 2 weight = 6) -> lead wins.
+        # tapped notes (2 + 222 = wait: 2 notes + 2 flags * 2 weight = 6) -> lead wins.
         # Section 2 (3840+): rhythm has 4 plain notes, lead has 1 plain -> rhythm wins.
         rhythm = [_note(t) for t in (0, 960, 1920, 2880)] + [_note(t) for t in (3840, 4800, 5760, 6720)]
         lead = [_note(t, pitch=70, tap=True) for t in (0, 1920)] + [_note(3840, pitch=70)]
@@ -77,7 +77,9 @@ class TestMapper:
         assert len(notes) == 1
         assert notes[0].sustain == 2 * CHART_RESOLUTION  # two quarters, no trim needed
 
-    def test_chord_lanes_adjacent_max_three_wide(self):
+    def test_chord_lanes_interval_spread_max_three_wide(self):
+        # Intervals here are 7, 5, 7 semitones (P5, P4, P5) -> gap=2 each,
+        # so lanes should skip rather than sit adjacent.
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
             _note(0, pitch=47, string=2, fret=5, chord_id=0),
@@ -88,8 +90,77 @@ class TestMapper:
         assert len(notes) == 1
         lanes = notes[0].lanes
         assert len(lanes) == 3  # capped
-        assert lanes == list(range(lanes[0], lanes[0] + 3))  # adjacent
+        assert lanes == [0, 2, 4]  # interval-spread, not adjacent
         assert max(lanes) <= 4
+
+    def test_power_chord_lanes_skip_not_adjacent(self):
+        # A classic power chord: root + perfect 5th (7 semitones) ->
+        # gap=2, so this should land on skipped lanes (e.g. 0,2), not
+        # forced adjacent lanes (0,1).
+        chord = [
+            _note(0, pitch=40, string=1, fret=5, chord_id=0),
+            _note(0, pitch=47, string=2, fret=5, chord_id=0),
+        ]
+        notes = map_notes(chord)
+        assert len(notes) == 1
+        lanes = notes[0].lanes
+        assert len(lanes) == 2
+        assert lanes[1] - lanes[0] == 2
+
+    def test_different_chords_never_repeat_same_lanes(self):
+        # C5 (36+43) and Eb5 (39+46) both anchor to base 0 naively
+        # (36%3 == 39%3) — the anti-repeat rule must nudge the second
+        # chord so consecutive different chords never share lanes.
+        notes = []
+        for i, root in enumerate([36, 39]):
+            notes += [
+                _note(i * 960, pitch=root, string=1, fret=0, chord_id=i),
+                _note(i * 960, pitch=root + 7, string=2, fret=2, chord_id=i),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 2
+        assert mapped[0].lanes != mapped[1].lanes
+
+    def test_repeated_identical_chord_keeps_lanes(self):
+        # Chugging the same chord twice must NOT trigger the nudge —
+        # identical pitches keep identical lanes.
+        notes = []
+        for i in range(2):
+            notes += [
+                _note(i * 960, pitch=36, string=1, fret=0, chord_id=i),
+                _note(i * 960, pitch=43, string=2, fret=2, chord_id=i),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 2
+        assert mapped[0].lanes == mapped[1].lanes
+
+    def test_wide_chords_anti_repeat_fallback(self):
+        # Two different full-width chords back-to-back: base can't
+        # shift (n_bases == 1), so the shape itself must change.
+        # 3-note: root + m7 + another m7 -> gaps 4+4, span 8 -> [0,2,4].
+        notes = []
+        for i, root in enumerate([36, 38]):
+            notes += [
+                _note(i * 960, pitch=root, string=1, fret=0, chord_id=i),
+                _note(i * 960, pitch=root + 10, string=2, fret=0, chord_id=i),
+                _note(i * 960, pitch=root + 20, string=3, fret=0, chord_id=i),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 2
+        assert mapped[0].lanes != mapped[1].lanes
+        assert all(len(n.lanes) == 3 for n in mapped)  # no note loss
+
+        # 2-note full-width (octave-ish, span 4): also must differ.
+        notes = []
+        for i, root in enumerate([36, 38]):
+            notes += [
+                _note((i + 10) * 960, pitch=root, string=1, fret=0, chord_id=i + 10),
+                _note((i + 10) * 960, pitch=root + 12, string=3, fret=0, chord_id=i + 10),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 2
+        assert mapped[0].lanes != mapped[1].lanes
+        assert all(len(n.lanes) == 2 for n in mapped)
 
     def test_flags_and_sustain_threshold(self):
         ir = [
