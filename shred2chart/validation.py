@@ -21,8 +21,10 @@ def validate_song_folder(
     audio = output / "song.ogg"
     if not chart.is_file():
         errors.append(f"missing chart: {chart}")
-    elif "[Song]" not in chart.read_text(encoding="utf-8"):
-        errors.append(f"{chart} is missing its [Song] section")
+    else:
+        with chart.open(encoding="utf-8") as chart_file:
+            if not any("[Song]" in line for line in chart_file):
+                errors.append(f"{chart} is missing its [Song] section")
     if not song_ini.is_file():
         errors.append(f"missing metadata: {song_ini}")
     else:

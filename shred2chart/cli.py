@@ -130,7 +130,7 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
 
 def _safe_path_part(value: str) -> str:
     """Keep metadata-derived output paths within the songs directory."""
-    cleaned = re.sub(r"[\x00-\x1f\x7f]", "_", value)
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "_", value)
     cleaned = cleaned.replace("/", "_").replace("\\", "_").replace(":", "_").strip(" .")
     return cleaned or "Untitled"
 
