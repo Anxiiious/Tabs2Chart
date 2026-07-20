@@ -187,9 +187,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     for choice in choices:
         print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
+    tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
+        tempo_events, sections, chart_notes, bars=args.lead_in_bars
+    )
+    if lead_in_ms:
+        print(f"\nadded {args.lead_in_bars} lead-in bar(s) ({lead_in_ms}ms) before the first note")
+
     out_dir = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
     chart_writer.write_song_folder(
-        out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
+        out_dir, title, artist, tempo_events, sections, chart_notes,
+        offset_ms=lead_in_ms + args.offset_ms,
     )
     print(f"\nwrote {out_dir}/notes.chart and song.ini")
 
@@ -360,7 +367,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
-        help="audio offset in milliseconds (calibrate in Moonscraper later; default 0)",
+        help="extra audio offset in milliseconds, on top of --lead-in-bars "
+        "(for fine-tuning after calibrating in Moonscraper; default 0)",
+    )
+    p_convert.add_argument(
+        "--lead-in-bars", type=int, default=2,
+        help="bars of silence to insert before the first note, so the highway "
+        "scrolls before play starts and Clone Hero's audio calibration has "
+        "something to judge against (default 2; 0 disables)",
     )
     p_convert.add_argument(
         "--audio",

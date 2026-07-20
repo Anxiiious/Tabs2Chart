@@ -18,7 +18,62 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .mapper import FORCED_FLAG, TAP_FLAG, CHART_RESOLUTION, ChartNote, _to_chart_ticks
+from .mapper import (
+    FORCED_FLAG, TAP_FLAG, CHART_RESOLUTION, IR_TICKS_PER_QUARTER, ChartNote, _to_chart_ticks,
+)
+
+
+def add_lead_in(
+    tempo_events: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    chart_notes: list[ChartNote],
+    bars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[ChartNote], int]:
+    """Shift every tick later by `bars` bars of silence, so the highway
+    scrolls before the first note instead of starting instantly - the
+    instant-start is what makes Clone Hero's audio calibration hard to
+    judge by eye/ear. Returns the shifted (tempo_events, sections,
+    chart_notes) plus the audio delay in ms needed to keep the (unshifted)
+    song.ogg landing under the now-later downbeat.
+
+    Bar length is computed from the time signature in effect at tick 0
+    (falling back to 4/4, .chart's own implicit default), since a "bar" is
+    a musical unit, not a fixed tick count. tempo_events/sections arrive at
+    the IR tick scale (960/quarter, see gpif_tempo/tempo) while chart_notes
+    are already at chart scale (192/quarter, see mapper) - both must shift
+    by the same musical duration, expressed in each one's own tick units.
+    """
+    if bars <= 0:
+        return tempo_events, sections, chart_notes, 0
+
+    numerator, denominator = 4, 4
+    for event in sorted(tempo_events, key=lambda e: e["tick"]):
+        if event["tick"] > 0:
+            break
+        if event["type"] == "time_signature":
+            numerator, denominator = event["numerator"], event["denominator"]
+    bar_quarters = numerator * 4 / denominator
+    ir_shift = round(bar_quarters * IR_TICKS_PER_QUARTER * bars)
+    chart_shift = round(bar_quarters * CHART_RESOLUTION * bars)
+
+    bpm = 120.0
+    for event in sorted(tempo_events, key=lambda e: e["tick"]):
+        if event["tick"] > 0:
+            break
+        if event["type"] == "tempo":
+            bpm = event["bpm"]
+    lead_in_ms = round(bar_quarters * bars * 60000 / bpm)
+
+    shifted_tempo = [{**e, "tick": e["tick"] + ir_shift} for e in tempo_events]
+    shifted_sections = [{**s, "tick": s["tick"] + ir_shift} for s in sections]
+    shifted_notes = [
+        ChartNote(
+            tick=n.tick + chart_shift, lanes=n.lanes, sustain=n.sustain,
+            forced=n.forced, tap=n.tap, source=n.source,
+        )
+        for n in chart_notes
+    ]
+    return shifted_tempo, shifted_sections, shifted_notes, lead_in_ms
 
 
 def _sync_track_lines(tempo_events: list[dict[str, Any]]) -> list[str]:

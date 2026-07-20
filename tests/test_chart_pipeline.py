@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from shred2chart.blend import blend_tracks
-from shred2chart.chart_writer import build_chart
-from shred2chart.mapper import CHART_RESOLUTION, map_notes
+from shred2chart.chart_writer import add_lead_in, build_chart
+from shred2chart.mapper import CHART_RESOLUTION, IR_TICKS_PER_QUARTER, ChartNote, map_notes
 
 IR_QUARTER = 960  # IR ticks per quarter note
 
@@ -133,3 +133,48 @@ class TestChartWriter:
         assert "0 = N 0 360" in text
         assert "384 = N 1 0" in text  # pitch 41 % 5 = lane 1
         assert "384 = N 5 0" in text  # forced flag at same tick
+
+
+class TestLeadIn:
+    def test_zero_bars_is_a_no_op(self):
+        tempo = [{"tick": 0, "type": "tempo", "bpm": 120}]
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        notes = [ChartNote(tick=0, lanes=[0])]
+        st, ss, sn, delay = add_lead_in(tempo, sections, notes, bars=0)
+        assert (st, ss, sn, delay) == (tempo, sections, notes, 0)
+
+    def test_shifts_every_tick_by_whole_bars(self):
+        # 4/4: one bar = 4 quarters. tempo_events/sections are IR-scale
+        # (960/quarter); chart_notes are chart-scale (192/quarter) - same
+        # musical shift, different tick units.
+        tempo = [
+            {"tick": 0, "type": "time_signature", "numerator": 4, "denominator": 4},
+            {"tick": 0, "type": "tempo", "bpm": 120},
+        ]
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        notes = [ChartNote(tick=0, lanes=[0], sustain=96)]
+        st, ss, sn, delay = add_lead_in(tempo, sections, notes, bars=2)
+        ir_bar = IR_TICKS_PER_QUARTER * 4
+        chart_bar = CHART_RESOLUTION * 4
+        assert [e["tick"] for e in st] == [2 * ir_bar, 2 * ir_bar]
+        assert ss == [{"tick": 2 * ir_bar, "bar": 0, "name": "Intro"}]
+        assert sn[0].tick == 2 * chart_bar
+        assert sn[0].sustain == 96  # sustain length is untouched, only position shifts
+
+    def test_lead_in_ms_matches_bar_length_at_tempo(self):
+        # 2 bars of 4/4 at 120 bpm = 8 quarters = 4 seconds = 4000ms exactly.
+        tempo = [
+            {"tick": 0, "type": "time_signature", "numerator": 4, "denominator": 4},
+            {"tick": 0, "type": "tempo", "bpm": 120},
+        ]
+        _, _, _, delay = add_lead_in(tempo, [], [], bars=2)
+        assert delay == 4000
+
+    def test_uses_time_signature_in_effect_at_tick_zero(self):
+        # 3/4 instead of 4/4 changes bar length: 3 quarters/bar at 120bpm.
+        tempo = [
+            {"tick": 0, "type": "time_signature", "numerator": 3, "denominator": 4},
+            {"tick": 0, "type": "tempo", "bpm": 120},
+        ]
+        _, _, _, delay = add_lead_in(tempo, [], [], bars=2)
+        assert delay == 3000  # 2 bars * 3 quarters * 500ms/quarter
