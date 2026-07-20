@@ -64,6 +64,25 @@ mentioning "repeat" and "D.S. al Coda" — if a new song you convert still drift
 coding agent, this might be a case (nested Codas, D.C./Fine markers) the fix doesn't cover
 yet (see `SHRED2CHART_GAMEPLAN.md` §10, Open Questions).
 
+## Status as of 2026-07-19: charts are good
+
+A full song (`Still Searching` by Senses Fail) has been playtested end-to-end in Clone Hero across
+several rounds of real feedback, and the user confirmed it "looks great now." Ten real mapping bugs
+(M4 v1-v10) and one audio-sync sign bug got found and fixed this way — see
+`SHRED2CHART_GAMEPLAN.md` §8 (Current State) for the full blow-by-blow if you need the history, but
+you don't need to re-derive any of it to keep using the tool. Two things worth knowing before you
+convert your next song:
+
+- **Auto-blending across multiple guitar tracks can pick a rhythm part over a lead part** for a
+  whole named section, if that section repeats and only part of the repeat has the interesting
+  part. If a chart sounds like it's missing an obvious lead line, try `--track N` (chart one track
+  verbatim — see `list-tracks` for the index) instead of the default auto-blend.
+- **One known, deliberate gap, not a bug:** chords currently always voice as physically-adjacent
+  lanes (e.g. a power chord's two notes sit next to each other on the highway), matching how the
+  chord is actually fretted. The user wants a follow-up that can spread some chords across
+  non-adjacent lanes purely for strumming variety, the way some professionally-charted songs do —
+  this hasn't been designed yet (see `SHRED2CHART_GAMEPLAN.md` Open Questions, 2026-07-19 entry).
+
 ## After You Convert a Song
 
 **If you passed `--audio your_song.flac` to `convert`**, `song.ogg` is already in the
@@ -108,15 +127,24 @@ folder — skip to step 4.
 1. Pick a song from your Sheet Happens album
 2. Run `shred2chart list-tracks song.gp` to see what's in it
 3. Run `shred2chart convert song.gp --audio song.flac` to make a chart with audio included
+   (add `--track N` instead of the default auto-blend if a chart seems to be missing an obvious
+   lead line — see "Status as of 2026-07-19" above)
 4. Test in Clone Hero or Moonscraper
 5. If it still doesn't sync right after the built-in lead-in, use `--offset-ms` to fine-tune
-   (see "Important: the chart now tracks repeats..." above if the drift gets *worse* over
-   the course of the song — that's a specific, mostly-fixed bug, not a calibration issue)
 
-**Outstanding as of 2026-07-19:** the repeat/D.S. al Coda timing fix and the 2-bar lead-in
-are both implemented and verified mathematically, but haven't had their in-game playtest
-result reported back yet. If you're picking this up, that's the natural next thing to
-check and log in `SHRED2CHART_GAMEPLAN.md` §8 (Current State).
+**What's actually next for this project (as of 2026-07-19), in priority order:**
+
+1. **Convert the rest of your library** with the tool as it stands — the mapping/timing engine
+   is playtested and confirmed good; more songs mostly means more data on whether the same
+   bug classes recur on different material, not more engine work.
+2. **App container (M6, not started)** — you asked for a drop-a-file-in program instead of the
+   CLI. `SHRED2CHART_GAMEPLAN.md` §11 has the concrete design questions (target OS/packaging,
+   drag-and-drop vs. a small GUI window, ffmpeg bundling) that need answering before a coding
+   agent should start building — it's a real design conversation, not just "go build it," so
+   walk through §11 with your agent first.
+3. **Non-adjacent chord-lane spreading for playability** (see Open Questions) — a real, wanted
+   feature, not yet designed. Lower priority than the app container unless you hit it again while
+   converting more songs and it bothers you enough to want it sooner.
 
 ## Questions?
 

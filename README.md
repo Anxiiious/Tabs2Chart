@@ -6,8 +6,9 @@ preserving the tab's tempo so the chart is rhythm-synced to the real recording.
 **Full plan, current progress, and open decisions live in [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md).**
 That file is the project's source of truth — read it before diving deeper than this README.
 
-**Status:** produces playable (if rough) charts — `shred2chart convert` writes a complete Clone
-Hero song folder. See "Where things stand" below.
+**Status:** produces playable charts — `shred2chart convert` writes a complete Clone Hero song
+folder, and the note-mapping/timing engine has been playtested end-to-end in Clone Hero and
+confirmed good (as of 2026-07-19). See "Where things stand" below.
 
 This README assumes you've never used Python packaging, `pytest`, or GitHub before. Every command
 below is meant to be copy-pasted as-is.
@@ -51,7 +52,7 @@ Commands so far, run as `shred2chart <command>`:
 | `shred2chart dump-tempo song.gp` | Prints every tempo/time-signature change found in the file, as JSON. Works directly on `.gp`/`.gpx`, or on a `.gp3`/`.gp4`/`.gp5` via PyGuitarPro. |
 | `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
 | `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide in/out, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties, accent, ghost note) — as JSON. |
-| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority; `--audio song.flac` to auto-convert and include `song.ogg`; `--lead-in-bars N` (default 2) for calibration-friendly silence before the first note; `--offset-ms` for fine-tuning audio sync on top of that. |
+| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority; `--track N` to chart exactly one track verbatim (no blending — use this if auto-blend picks the wrong part for a section, see below); `--audio song.flac` to auto-convert and include `song.ogg` (ffmpeg-backed, see `shred2chart/media.py`); `--album-art cover.jpg` likewise for `album.png`; `--lead-in-bars N` (default 2) for calibration-friendly silence before the first note; `--offset-ms` for fine-tuning audio sync on top of that; `-o/--out` for a custom output folder. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 `convert` is the one that makes something playable; the rest are inspection tools that show you
@@ -116,25 +117,32 @@ says every session must record it in the "Current State" section before moving o
   `.gp3`/`.gp4`/`.gp5` files (`dump-ir`), and every technique flag has shown up with a plausible
   count against a real file. This is milestone M1, and it's not fully checked off yet — it still
   needs a human to spot-check the output against the tab open in actual Guitar Pro (see §4 above).
-- `shred2chart convert` now writes a complete Clone Hero song folder. The note mapping is still
-  the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
-  next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
-  notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
-  song with `--audio song.flac` and try it in Clone Hero or Moonscraper.**
-- **Timing fix (2026-07-19):** an actual playtest surfaced a real bug — charts drifted
-  progressively later than the audio, because the converter walked the tab in *written* order
-  instead of the *performance* order Guitar Pro actually plays (repeat barlines, 1st/2nd
-  endings, and D.S. al Coda/Segno-Coda navigation all replay or skip material). This is now
-  simulated (`gpif_tempo.compute_playback_order`) for `.gp` (GP7) files and verified against a
-  real song's embedded section timestamps to within about a second, start to finish. Also added
-  a `--lead-in-bars` flag (default 2) so charts don't start on tick 0 — Clone Hero's audio
-  calibration needs a beat of silence to judge against. **Not yet done:** the in-game playtest
-  of this fixed version hasn't been reported back; the identical bug in the PyGuitarPro
-  (`.gp3`/`.gp4`/`.gp5`) path was left unfixed since no real file needing it has turned up there.
-  See `SHRED2CHART_GAMEPLAN.md` §8's 2026-07-19 entry for the full story.
+- `shred2chart convert` writes a complete Clone Hero song folder, including audio (`--audio`,
+  ffmpeg-backed) and album art (`--album-art`). Sections blend lead/rhythm tracks (or chart one
+  track verbatim with `--track N`), chugs come out as open notes, hammer-ons/taps/ties carry over.
+- **Timing fix (2026-07-19, playtest-confirmed):** charts stay in sync with the audio through
+  repeat barlines, 1st/2nd endings, and D.S. al Coda/Segno-Coda navigation — the converter
+  simulates real Guitar Pro *performance* order (`gpif_tempo.compute_playback_order`), not just
+  written order. A `--lead-in-bars` flag (default 2) adds silence before the first note so Clone
+  Hero's audio calibration has something to judge against.
+- **Note mapping (2026-07-19, playtest-confirmed):** the "smart contour" mapping (`mapper.py`)
+  went through ten real-bug iterations (M4 v1-v10), each driven by an actual in-game playtest
+  round, not speculative tuning — hand-position grouping, rank-ordered lane spread, exact-repeat
+  memoization (scoped correctly per hand-position group, not globally), and fret-aware grouping so
+  a low pedal tone on one string doesn't fragment a lead phrase into isolated notes. A full song
+  has been played start to finish in Clone Hero and confirmed to look and feel right, with one
+  known, deliberately-deferred gap: chords always voice as physically-adjacent lanes for now (see
+  Open Questions in the game plan for the follow-up ask — non-adjacent lanes for playability, not
+  fretting realism).
+- **Audio offset sign (2026-07-19, fixed):** `Offset`/`delay` are correctly negative now (audio
+  plays *later* than the chart's shifted tick 0) — previously positive, which required manually
+  re-correcting the offset in Moonscraper on every single export.
+- **Next up: an app container** so converting a song doesn't require the terminal — drop a `.gp`
+  and an audio file in, get a finished song folder out. Not started; see
+  `SHRED2CHART_GAMEPLAN.md` §11 for the open design questions.
 
-See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
-the detailed, up-to-date picture.
+See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones), §8 (Current State), and
+§11 (App Container plan) for the detailed, up-to-date picture.
 
 ## 6. Project layout
 
@@ -146,8 +154,9 @@ shred2chart/          the actual tool (Python package)
   tempo.py              reads tempo data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   ir_gp.py               reads per-note data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   blend.py              blends lead + rhythm tracks per section into one playable line
-  mapper.py             maps notes onto the 5 Clone Hero lanes (naive version)
+  mapper.py             maps notes onto the 5 Clone Hero lanes (playtest-confirmed contour mapping)
   chart_writer.py       writes notes.chart + song.ini
+  media.py              ffmpeg-backed audio/album-art conversion (--audio/--album-art)
   cli.py                the `shred2chart` command
 tests/                 automated tests (run with `pytest`)
 test_data/             put your real .gpx/.gp5 files here (git-ignored)
