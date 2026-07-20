@@ -1,7 +1,7 @@
 """Command-line entry point for shred2chart.
 
 Run `shred2chart --help` (after installing, see README.md) to see all
-commands. Every command prints plain, readable output — no GUI required.
+commands. Every command prints plain, readable output - no GUI required.
 """
 from __future__ import annotations
 
@@ -160,7 +160,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         track_ids = _guess_guitar_tracks(tracks)
 
     names = dict(tracks)
-    print(f"{title} — {artist}")
+    print(f"{title} - {artist}")
     print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
     tempo_events = gpif_tempo.dump_tempo_events(xml_text)
@@ -176,7 +176,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
             for i in range(0, len(bar_starts), 8)
         ]
-        print("(no section markers in file — blending in 8-bar windows instead)")
+        print("(no section markers in file - blending in 8-bar windows instead)")
 
     tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
     blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
@@ -260,15 +260,15 @@ def _cmd_verify_m0(args: argparse.Namespace) -> int:
 
     if not original_only and not converted_only:
         print(
-            f"\nGO — every tempo/time-signature event in {gpx_path.name} has a matching one in "
+            f"\nGO - every tempo/time-signature event in {gpx_path.name} has a matching one in "
             f"{gp_path.name}. Route A (external conversion) looks safe for this file."
         )
     else:
         print(
-            f"\nNO-GO (or partial) — {len(original_only)} event(s) only in the original, "
+            f"\nNO-GO (or partial) - {len(original_only)} event(s) only in the original, "
             f"{len(converted_only)} only in the converted file. See SHRED2CHART_GAMEPLAN.md "
-            "§3 for the Route B fallback (direct GPIF parsing skips this conversion step "
-            "entirely, and already works for GP7 '.gp' files — see `dump-tempo`)."
+            "section 3 of the Route B fallback (direct GPIF parsing skips this conversion step "
+            "entirely, and already works for GP7 '.gp' files - see `dump-tempo`)."
         )
     return 0
 
