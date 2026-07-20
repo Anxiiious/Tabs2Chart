@@ -24,3 +24,40 @@ def test_interactive_prompt_allows_track_and_output_selection(monkeypatch, tmp_p
     )
 
     assert result == ([1, 0], tmp_path / "output")
+
+
+def test_interactive_prompt_retries_invalid_track_selection(monkeypatch, tmp_path):
+    answers = iter(["bad", "9", "", str(tmp_path / "output")])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    args = Namespace(out=None)
+
+    result = _prompt_convert_options(
+        args,
+        [(0, "Rhythm Guitar"), (1, "Lead Guitar")],
+        [1, 0],
+        {0: "Rhythm Guitar", 1: "Lead Guitar"},
+        "Artist",
+        "Title",
+    )
+
+    assert result == ([1, 0], tmp_path / "output")
+
+
+def test_interactive_prompt_can_cancel_overwrite(monkeypatch, tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "existing.chart").write_text("old", encoding="utf-8")
+    answers = iter(["1", str(output), "n"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    args = Namespace(out=None)
+
+    result = _prompt_convert_options(
+        args,
+        [(0, "Rhythm Guitar"), (1, "Lead Guitar")],
+        [1, 0],
+        {0: "Rhythm Guitar", 1: "Lead Guitar"},
+        "Artist",
+        "Title",
+    )
+
+    assert result is None

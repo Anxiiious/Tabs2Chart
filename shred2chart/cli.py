@@ -244,11 +244,12 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     for choice in choices:
         print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
-    out_dir = (
-        interactive_out
-        if interactive_out is not None
-        else Path(args.out) if args.out else _default_output_dir(artist, title)
-    )
+    if interactive_out is not None:
+        out_dir = interactive_out
+    elif args.out:
+        out_dir = Path(args.out)
+    else:
+        out_dir = _default_output_dir(artist, title)
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes, offset_ms=args.offset_ms
     )
