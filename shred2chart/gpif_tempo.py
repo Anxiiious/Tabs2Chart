@@ -155,9 +155,15 @@ def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
                 continue
             end_tick, end_bpm, _ = raw[i + 1]
             span = end_tick - tick_pos
-            n_beats = max(1, span // TICKS_PER_QUARTER)
+            # Use round() rather than floor division so a ramp that spans
+            # e.g. 1.5 beats maps to 2 events rather than being truncated to 1.
+            n_beats = max(1, round(span / TICKS_PER_QUARTER))
             for beat in range(n_beats):
                 t = tick_pos + beat * TICKS_PER_QUARTER
+                # Interpolation fraction 0..(<1): the ramp covers the half-open
+                # interval [start_tick, end_tick).  The endpoint BPM is emitted
+                # by the following automation's own event, so beat==n_beats
+                # (frac==1.0) is intentionally excluded from this loop.
                 frac = beat / n_beats
                 interp = bpm + frac * (end_bpm - bpm)
                 interp = round(interp, 6)

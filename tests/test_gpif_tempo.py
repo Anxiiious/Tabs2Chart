@@ -8,6 +8,8 @@ SHRED2CHART_GAMEPLAN.md's Current State.
 """
 from __future__ import annotations
 
+import pytest
+
 from shred2chart.gpif_tempo import TICKS_PER_QUARTER, dump_tempo_events
 
 GPIF_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
@@ -124,6 +126,10 @@ def test_linear_ramp_produces_per_beat_events():
     bpms = [e["bpm"] for e in ramp_events]
     assert bpms == sorted(bpms)
     assert bpms[0] == 100
+    # The ramp covers [start_tick, end_tick) — beat 7 of 8 has frac = 7/8,
+    # so its BPM is 100 + 7/8 * 40 = 135.  The endpoint 140 is NOT in the
+    # ramp; it comes from the following automation's own event (see below).
+    assert bpms[-1] == pytest.approx(135.0)
 
     # The endpoint automation is present as a normal instant event.
     end_events = [e for e in tempos if e["tick"] == ramp_end_tick]
