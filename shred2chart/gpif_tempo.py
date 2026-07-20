@@ -7,11 +7,16 @@ so the schema below — <MasterTrack><Automations><Automation> with
 <Type>Tempo</Type>, <Bar>, <Position>, <Value>"bpm ref"</Value>, and
 per-bar <MasterBar><Time>N/D</Time> — is confirmed real, not guessed.
 
-Caveat: that reference file only had ONE tempo automation (a constant
-123 bpm, at Bar 0 Position 0) — there was no example of a *mid-bar*
-tempo change to confirm what a nonzero <Position> means. We assume it's
-a 0..1 fraction of the bar (the common convention), but treat that as
-unverified until we see a real file with a mid-bar change.
+Caveats:
+- <Position>: the reference files seen so far only have Position=0 (bar
+  start).  We assume a nonzero value is a 0..1 fraction of the bar (the
+  common convention), but treat that as unverified until a real file with
+  a mid-bar change turns up.
+- <Linear>true</Linear>: indicates a gradual tempo ramp to the next
+  automation point.  .chart has no ramp concept, so this is discretized
+  into one stepped "B" event per beat across the ramp span (per §4 of
+  the game plan).  This path has been exercised by a synthetic test
+  fixture but not yet against a real GP file that carries a ramp.
 
 Output shape matches shred2chart.tempo.dump_tempo_events exactly, so
 events from a converted .gp5 (PyGuitarPro) and events read directly from
@@ -101,6 +106,8 @@ def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
             })
             previous_sig = sig
 
+    # First pass: collect every Tempo automation as (tick, bpm, linear).
+    raw: list[tuple[int, float, bool]] = []
     for automation in root.findall("./MasterTrack/Automations/Automation"):
         type_el = automation.find("Type")
         if type_el is None or type_el.text != "Tempo":
@@ -114,14 +121,48 @@ def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
         bar = int(bar_el.text)
         position = float(position_el.text)
         bpm = float(value_el.text.split()[0])
-        if bpm.is_integer():
-            bpm = int(bpm)
 
         if not (0 <= bar < len(bar_starts)):
             raise GpifFormatError(f"Tempo automation references out-of-range bar {bar}")
         numerator, denominator = bar_signatures[bar]
         tick_pos = bar_starts[bar] + round(position * _bar_length_ticks(numerator, denominator))
-        events.append({"tick": tick_pos, "type": "tempo", "bpm": bpm})
+
+        linear_el = automation.find("Linear")
+        linear = (
+            linear_el is not None
+            and linear_el.text is not None
+            and linear_el.text.strip().lower() == "true"
+        )
+        raw.append((tick_pos, bpm, linear))
+
+    raw.sort(key=lambda t: t[0])
+
+    # Second pass: emit events.  Linear automations are discretized into one
+    # stepped B event per beat (TICKS_PER_QUARTER) across the ramp span,
+    # interpolating bpm toward the next automation's value.  This matches
+    # §4 of the game plan ("one stepped B event per beat across the ramp
+    # span") and produces a .chart-compatible step-function approximation.
+    for i, (tick_pos, bpm, linear) in enumerate(raw):
+        if not linear:
+            bpm_out = int(bpm) if float(bpm).is_integer() else bpm
+            events.append({"tick": tick_pos, "type": "tempo", "bpm": bpm_out})
+        else:
+            # If this is the last automation, no ramp endpoint is known:
+            # fall back to a single instantaneous event.
+            if i + 1 >= len(raw):
+                bpm_out = int(bpm) if float(bpm).is_integer() else bpm
+                events.append({"tick": tick_pos, "type": "tempo", "bpm": bpm_out})
+                continue
+            end_tick, end_bpm, _ = raw[i + 1]
+            span = end_tick - tick_pos
+            n_beats = max(1, span // TICKS_PER_QUARTER)
+            for beat in range(n_beats):
+                t = tick_pos + beat * TICKS_PER_QUARTER
+                frac = beat / n_beats
+                interp = bpm + frac * (end_bpm - bpm)
+                interp = round(interp, 6)
+                bpm_out = int(interp) if float(interp).is_integer() else interp
+                events.append({"tick": t, "type": "tempo", "bpm": bpm_out})
 
     events.sort(key=lambda e: e["tick"])
     return events
