@@ -522,13 +522,15 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
   open-chug-chord xfail is fixed as a structural side effect (no longer reads `OPEN_NOTE` as a
   placement seed). See Current State and Decision Log. The "untested against a real
   chord-bearing file" half of this question still stands — no real `.gp` playtest of chord-heavy
-  material has happened yet, only synthetic fixtures. **Sub-question resolved 2026-07-21**:
-  whether the chord-shape scoring's cursor resync could compound into drift over a long
-  chord-heavy solo — proven both mathematically and via a 250-chord adversarial stress test
-  (`test_cursor_resync_does_not_drift_over_long_progression`) not to, since it's a bounded
-  phase-shift with no mechanism to bias future step sizes. See Current State. The "does a real
-  power chord's lane placement look musically sensible on an actual chart" half is a separate,
-  still-open question that only a real playtest answers.
+  material has happened yet, only synthetic fixtures. **This is now purely a heuristic-quality
+  question, not a correctness one** — cursor-resync drift (previously the correctness-flavored
+  half of this concern) is no longer listed as an open architectural risk at all: it's proven,
+  both mathematically and by an encoded regression test
+  (`test_cursor_resync_does_not_drift_over_long_progression`), not a hypothesis awaiting
+  validation. See Current State's 2026-07-21 "resync-drift question actually settled" entry and
+  the Decision Log. What remains open here is strictly "does a real power chord's lane placement
+  *read well* on an actual chart" — only a real playtest answers that, and no amount of further
+  reasoning about the algorithm's correctness will substitute for it.
 - Closed 2026-07-21, N/A: RBN's Trill/Tremolo lane markers are a Rock Band MIDI-engine-specific
   mechanic with no equivalent in the `.chart` text format this project emits. No action needed.
 - New (2026-07-20): `ghost_note` in `ir_gpif.py` is now implemented as `"GhostNote" in props` (inferred from the GPIF property naming pattern), but has not been verified against a real file that carries a ghost note. If a real file turns up and `ghost_note` is always `False` despite visible ghost notes in the tab, check whether GP7 uses a different property name (e.g. at the beat level, or under a different `<Property name=...>` key) and fix accordingly.
@@ -549,14 +551,27 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
      `test_cursor_resync_does_not_drift_over_long_progression` (see Current State, done this
      session) is a first instance of this — a long adversarial staircase/chord-heavy run — but not
      the complete single_notes/dyads/triads/etc. corpus envisioned.
-  3. Stress-test cursor resynchronization with synthetic "worst-case" charts (hundreds of
+  3. ~~Stress-test cursor resynchronization with synthetic "worst-case" charts (hundreds of
      consecutive chords, tempo changes, phrase boundaries) to determine whether drift is
-     theoretical or observable. **Done this session** — see Current State: proven not to occur,
-     both mathematically (bounded phase-shift, no mechanism to bias future step magnitude) and
-     empirically (250-chord adversarial run, no front-half/back-half growth). Priority 3 is the one
-     item from this list actually completed so far, since — unlike 1 and 2 — it didn't require any
-     external corpus or real file, only synthetic data already producible in this environment.
+     theoretical or observable.~~ **Closed 2026-07-21 — remove from the list of open architectural
+     risks entirely, not merely "resolved."** This is no longer a hypothesis awaiting validation;
+     it's a proven property of the algorithm (bounded phase-shift, no mechanism to bias future
+     step magnitude — see Current State and Decision Log) that is now encoded directly in the test
+     suite (`test_cursor_resync_does_not_drift_over_long_progression`). Any future change to the
+     resync mechanism gets caught by that test; no further reasoning or re-litigating of this
+     question is needed.
   4. Continue documenting known trade-offs rather than overengineering fixes before there's
      evidence they're needed — the operating principle behind not building 1/2 speculatively this
      session, and behind keeping the PR #9 follow-up to documentation/refactoring rather than a
      redesign.
+
+  **Net effect of closing #3: the project's primary outstanding work is now heuristic quality, not
+  correctness.** Every remaining open item above (#1, #2, and the "does a real power chord's lane
+  placement read well on an actual chart" question) is a "does this produce the most readable
+  charts?" question, not a "does this algorithm behave correctly?" one — the mapper's mechanism
+  (staircase wraparound, distinct-lane guarantee, chord-shape scoring, resync) is settled; what's
+  left to discover is whether the scoring weights and criteria actually match what a real chart
+  should look like, which only tuning against real material (playtest feedback, a representative
+  corpus) can answer. This is worth stating explicitly since it changes what kind of work is
+  valuable from here: more code-level correctness auditing of `mapper.py` has low expected payoff
+  now; getting real chord-bearing `.gp` files in front of the mapper does not.
