@@ -122,65 +122,99 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
-def _cmd_convert(args: argparse.Namespace) -> int:
-    path = Path(args.gp_file)
+class ConvertError(Exception):
+    """Raised by convert_song() for any recoverable input error (bad file,
+    unknown track, etc). Callers (CLI, GUI) turn this into their own
+    error display instead of an unhandled traceback."""
+
+
+class ConvertResult:
+    def __init__(self, out_dir: Path, title: str, artist: str, wrote_audio: bool, wrote_album_art: bool):
+        self.out_dir = out_dir
+        self.title = title
+        self.artist = artist
+        self.wrote_audio = wrote_audio
+        self.wrote_album_art = wrote_album_art
+
+
+def convert_song(
+    gp_file: str | Path,
+    out: str | Path | None = None,
+    audio: str | Path | None = None,
+    album_art: str | Path | None = None,
+    track: int | None = None,
+    tracks: str | None = None,
+    overrides: str | None = None,
+    lead_in_bars: int = 2,
+    offset_ms: int = 0,
+    on_progress=print,
+) -> ConvertResult:
+    """Convert a .gp/.gpx file into a Clone Hero song folder.
+
+    This is the reusable core behind the `convert` CLI command - the CLI
+    and the GUI both call this, so there is exactly one place the
+    blend -> map -> emit -> audio/art pipeline is wired up. Progress and
+    warnings are reported via on_progress(str) instead of print(), so a
+    GUI can route them into a log pane. Raises ConvertError for any
+    recoverable input problem (bad file, unknown track, etc); callers
+    decide how to display that.
+
+    overrides: optional "tick:track,tick:track,..." string (only used
+    when blending multiple tracks). Each pair pins every sub-window from
+    that IR tick onward to that track, bypassing the auto-blend scoring
+    entirely - for the rare passage where no scoring heuristic picks the
+    part the user actually wants (see blend.blend_tracks's docstring).
+    """
+    path = Path(gp_file)
     if path.suffix.lower() not in _CONTAINER_SUFFIXES:
-        print(
-            "error: convert currently supports .gp/.gpx files only (every real "
-            "Sheet Happens tab seen so far is .gp). For .gp5, ask for this to be extended.",
-            file=sys.stderr,
+        raise ConvertError(
+            "convert currently supports .gp/.gpx files only (every real "
+            "Sheet Happens tab seen so far is .gp). For .gp5, ask for this to be extended."
         )
-        return 1
 
     try:
         xml_text = gpx_reader.extract_gpif(path)
     except gpx_reader.GpxFormatError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+        raise ConvertError(str(e)) from e
 
     root = ET.fromstring(xml_text)
     title = (root.findtext("./Score/Title") or path.stem).strip() or path.stem
     artist = (root.findtext("./Score/Artist") or "Unknown Artist").strip() or "Unknown Artist"
 
-    tracks = ir_gpif.list_tracks(xml_text)
-    names = dict(tracks)
-    known = {t for t, _ in tracks}
+    all_tracks = ir_gpif.list_tracks(xml_text)
+    names = dict(all_tracks)
+    known = {t for t, _ in all_tracks}
 
-    if args.track is not None:
-        if args.track not in known:
-            print(f"error: track {args.track} not in this file. Available:", file=sys.stderr)
-            for track_id, name in tracks:
-                print(f"  {track_id}: {name}", file=sys.stderr)
-            return 1
-        track_ids = [args.track]
-    elif args.tracks:
+    if track is not None:
+        if track not in known:
+            lines = "\n".join(f"  {t}: {n}" for t, n in all_tracks)
+            raise ConvertError(f"track {track} not in this file. Available:\n{lines}")
+        track_ids = [track]
+    elif tracks:
         try:
-            track_ids = [int(t) for t in args.tracks.split(",")]
+            track_ids = [int(t) for t in tracks.split(",")]
         except ValueError:
-            print(f"error: --tracks must be comma-separated numbers, got {args.tracks!r}", file=sys.stderr)
-            return 1
+            raise ConvertError(f"--tracks must be comma-separated numbers, got {tracks!r}")
         unknown = [t for t in track_ids if t not in known]
         if unknown:
-            print(f"error: track(s) {unknown} not in this file. Available:", file=sys.stderr)
-            for track_id, name in tracks:
-                print(f"  {track_id}: {name}", file=sys.stderr)
-            return 1
+            lines = "\n".join(f"  {t}: {n}" for t, n in all_tracks)
+            raise ConvertError(f"track(s) {unknown} not in this file. Available:\n{lines}")
     else:
-        track_ids = _guess_guitar_tracks(tracks)
+        track_ids = _guess_guitar_tracks(all_tracks)
 
-    print(f"{title} - {artist}")
+    on_progress(f"{title} - {artist}")
 
     tempo_events = gpif_tempo.dump_tempo_events(xml_text)
     sections = gpif_tempo.dump_sections(xml_text)
 
-    if args.track is not None:
+    if track is not None:
         # Single-track mode: chart it verbatim, no blending/section-switching -
         # for when auto-blending multiple tracks produces a jumbled chart.
-        print(f"charting track {args.track} ({names[args.track]}) only, no blending")
-        blended = ir_gpif.dump_ir(xml_text, track_index=args.track)
+        on_progress(f"charting track {track} ({names[track]}) only, no blending")
+        blended = ir_gpif.dump_ir(xml_text, track_index=track)
         choices = []
     else:
-        print(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
+        on_progress(f"blending tracks: {', '.join(f'{t} ({names[t]})' for t in track_ids)}")
 
         # Blend at section granularity; if the file has no section markers,
         # fall back to fixed 8-bar windows so blending still happens at a
@@ -192,67 +226,111 @@ def _cmd_convert(args: argparse.Namespace) -> int:
                 {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
                 for i in range(0, len(bar_starts), 8)
             ]
-            print("(no section markers in file - blending in 8-bar windows instead)")
+            on_progress("(no section markers in file - blending in 8-bar windows instead)")
+
+        parsed_overrides: list[tuple[int, int]] = []
+        if overrides:
+            for pair in overrides.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                try:
+                    tick_str, track_str = pair.split(":")
+                    parsed_overrides.append((int(tick_str), int(track_str)))
+                except ValueError:
+                    raise ConvertError(
+                        f"--override entries must be 'tick:track', got {pair!r}"
+                    )
+            unknown = [t for _, t in parsed_overrides if t not in track_ids]
+            if unknown:
+                raise ConvertError(
+                    f"--override track(s) {unknown} aren't in the blended track "
+                    f"list {track_ids} (see --tracks)"
+                )
 
         tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
-        blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+        blended, choices = blend.blend_tracks(
+            tracks_notes, track_ids, blend_spans, overrides=parsed_overrides or None
+        )
 
     chart_notes = mapper.map_notes(blended)
 
-    print(f"\n{len(sections)} section(s), {len(blended)} notes"
-          f"{'' if args.track is not None else ' after blending'}, "
-          f"{len(chart_notes)} chart events:")
+    on_progress(f"\n{len(sections)} section(s), {len(blended)} notes"
+                f"{'' if track is not None else ' after blending'}, "
+                f"{len(chart_notes)} chart events:")
     for choice in choices:
-        print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
+        on_progress(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
     tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
-        tempo_events, sections, chart_notes, bars=args.lead_in_bars
+        tempo_events, sections, chart_notes, bars=lead_in_bars
     )
     if lead_in_ms:
-        print(f"\nadded {args.lead_in_bars} lead-in bar(s) ({lead_in_ms}ms) before the first note")
+        on_progress(f"\nadded {lead_in_bars} lead-in bar(s) ({lead_in_ms}ms) before the first note")
 
-    out_dir = Path(args.out) if args.out else Path(f"songs/{artist} - {title}")
+    out_dir = Path(out) if out else Path(f"songs/{artist} - {title}")
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes,
-        offset_ms=lead_in_ms + args.offset_ms,
+        offset_ms=lead_in_ms + offset_ms,
     )
-    print(f"\nwrote {out_dir}/notes.chart and song.ini")
+    on_progress(f"\nwrote {out_dir}/notes.chart and song.ini")
 
-    if args.audio:
-        audio_path = Path(args.audio)
+    wrote_audio = False
+    if audio:
+        audio_path = Path(audio)
         if not audio_path.exists():
-            print(f"warning: --audio file not found: {audio_path}", file=sys.stderr)
+            on_progress(f"warning: --audio file not found: {audio_path}")
         elif not media.ffmpeg_available():
-            print(
+            on_progress(
                 "warning: ffmpeg not found on PATH, skipping audio conversion "
-                f"(convert {audio_path.name} to song.ogg manually and drop it in {out_dir})",
-                file=sys.stderr,
+                f"(convert {audio_path.name} to song.ogg manually and drop it in {out_dir})"
             )
         else:
             written = media.convert_audio(audio_path, out_dir)
             if written:
-                print(f"wrote {written}")
+                on_progress(f"wrote {written}")
+                wrote_audio = True
             else:
-                print(f"warning: ffmpeg failed to convert {audio_path}", file=sys.stderr)
+                on_progress(f"warning: ffmpeg failed to convert {audio_path}")
     else:
-        print("Drop the song's audio in that folder as song.ogg, then copy the folder "
-              "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
+        on_progress("Drop the song's audio in that folder as song.ogg, then copy the folder "
+                    "into Clone Hero's Songs directory (or open notes.chart in Moonscraper).")
 
-    if args.album_art:
-        art_path = Path(args.album_art)
+    wrote_album_art = False
+    if album_art:
+        art_path = Path(album_art)
         if not art_path.exists():
-            print(f"warning: --album-art file not found: {art_path}", file=sys.stderr)
+            on_progress(f"warning: --album-art file not found: {art_path}")
         else:
             written = media.place_album_art(art_path, out_dir)
             if written:
-                print(f"wrote {written}")
+                on_progress(f"wrote {written}")
+                wrote_album_art = True
             else:
-                print(
+                on_progress(
                     f"warning: could not place album art from {art_path} "
-                    "(ffmpeg not found on PATH and source isn't a .png)",
-                    file=sys.stderr,
+                    "(ffmpeg not found on PATH and source isn't a .png)"
                 )
 
+    return ConvertResult(out_dir, title, artist, wrote_audio, wrote_album_art)
+
+
+def _cmd_convert(args: argparse.Namespace) -> int:
+    try:
+        convert_song(
+            args.gp_file,
+            out=args.out,
+            audio=args.audio,
+            album_art=args.album_art,
+            track=args.track,
+            tracks=args.tracks,
+            overrides=args.override,
+            lead_in_bars=args.lead_in_bars,
+            offset_ms=args.offset_ms,
+            on_progress=print,
+        )
+    except ConvertError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -388,6 +466,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="chart exactly this one track, verbatim - no blending/section-switching logic "
         "at all (see `list-tracks` for the index). Use this if auto-blending multiple "
         "tracks produces a jumbled chart.",
+    )
+    p_convert.add_argument(
+        "--override",
+        help="comma-separated 'tick:track' pairs (IR ticks, 960/quarter); each pins every "
+        "sub-window from that tick onward to that track, bypassing auto-blend scoring - for "
+        "a passage where the automatic pick isn't the one you want (only applies when "
+        "blending multiple tracks, i.e. not with --track)",
     )
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(

@@ -54,6 +54,43 @@ class TestBlend:
         # Verse notes come from lead (2 notes), chorus from rhythm (4 notes)
         assert len(blended) == 6
 
+    def test_pitch_bonus_favors_established_higher_lead_over_busier_chug(self):
+        # A low, busy rhythm chug (more raw notes) against a higher,
+        # sparser lead line (fewer notes, both well above the min-notes
+        # floor) - the lead should win despite fewer notes, matching a
+        # real file ("Still Searching" section F/bar 33): guitar 1 chugs
+        # low with more raw notes than guitar 2's higher riff, so
+        # count-only scoring wrongly picked the chug for the section.
+        rhythm = [_note(t, pitch=42) for t in range(0, IR_QUARTER * 40, 240)]  # busy, low
+        lead = [_note(t, pitch=66) for t in range(0, IR_QUARTER * 40, 960)]  # sparser, high
+        sections = [{"tick": 0, "bar": 0, "name": "F"}]
+        _, choices = blend_tracks({0: rhythm, 1: lead}, [0, 1], sections)
+        assert all(c["track"] == 1 for c in choices)
+
+    def test_pitch_bonus_ignores_single_outlier_note(self):
+        # A single stray high note shouldn't out-leverage its pitch gap
+        # against an established, busier rhythm part - the bonus only
+        # applies once a track has PITCH_BONUS_MIN_NOTES notes.
+        rhythm = [_note(t) for t in (0, 960, 1920, 2880)]  # low (default pitch 40)
+        lead = [_note(0, pitch=70)]  # one high note, well under the floor
+        sections = [{"tick": 0, "bar": 0, "name": "Verse"}]
+        _, choices = blend_tracks({0: rhythm, 1: lead}, [0, 1], sections)
+        assert all(c["track"] == 0 for c in choices)
+
+    def test_override_pins_track_from_given_tick(self):
+        # Track 0 has the only notes in the first window, so it wins there
+        # by default scoring; both tracks have notes from the override
+        # tick onward, where track 0 is busier and would normally win, but
+        # the override should force track 1 there instead.
+        bar = 960 * 4
+        win = bar * 2
+        a = [_note(t) for t in range(0, win * 3, 240)]  # busy throughout
+        b = [_note(t, pitch=70) for t in range(win, win * 3, 960)]  # only from window 1
+        sections = [{"tick": 0, "bar": 0, "name": "K"}]
+        _, choices = blend_tracks({0: a, 1: b}, [0, 1], sections, overrides=[(win, 1)])
+        assert choices[0]["track"] == 0  # before the override: normal scoring
+        assert all(c["track"] == 1 for c in choices if c["start_tick"] >= win)
+
     def test_no_sections_means_single_span(self):
         rhythm = [_note(0), _note(960)]
         blended, choices = blend_tracks({0: rhythm}, [0], sections=[])
@@ -65,6 +102,59 @@ class TestBlend:
         b = [_note(0), _note(960)]
         _, choices = blend_tracks({0: a, 1: b}, [1, 0], sections=[])
         assert choices[0]["track"] == 1
+
+    def test_mid_section_switch_on_sub_window_boundary(self):
+        # A single section spanning 4 bars (0-15360 ticks): track 0 has more
+        # notes in the first 2 bars, track 1 in the last 2 - confirms a
+        # switch can happen mid-section, not only at section markers.
+        bar = 960 * 4
+        a = [_note(t) for t in range(0, bar * 2, 240)]  # busy in bars 0-1
+        b = [_note(t) for t in range(bar * 2, bar * 4, 240)]  # busy in bars 2-3
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        _, choices = blend_tracks({0: a, 1: b}, [0, 1], sections)
+        tracks_seen = {c["track"] for c in choices}
+        assert tracks_seen == {0, 1}
+
+    def test_sustained_tie_run_sticks_with_same_track(self):
+        # Two harmonized tracks tied on every window for a whole passage
+        # (same rhythm/technique count, different pitches) - real case:
+        # "Still Searching" guitars 2/3 play identical rhythm in harmony
+        # through the whole intro, BOTH audible in the mix continuously.
+        # A run of consecutive ties is one continuous harmony passage, not
+        # call-and-response, so the winner should stay fixed rather than
+        # hopping every window - confirmed against the real file, where
+        # the old always-alternate rule flipped tracks 4 times in ~40s of
+        # unchanging harmonized rhythm.
+        bar = 960 * 4
+        num_windows = 4
+        a = []
+        b = []
+        for w in range(num_windows):
+            base = w * bar * 2  # 2-bar sub-windows
+            a += [_note(base + t, pitch=54) for t in range(0, bar * 2, 480)]
+            b += [_note(base + t, pitch=57) for t in range(0, bar * 2, 480)]
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        _, choices = blend_tracks({0: a, 1: b}, [0, 1], sections)
+        winners = [c["track"] for c in choices]
+        assert winners == [winners[0]] * len(winners)  # stays on one track
+
+    def test_isolated_tie_still_alternates(self):
+        # A single tied window sandwiched between windows with a clear
+        # winner is genuine call-and-response, not a sustained harmony
+        # passage - it should still alternate away from whichever track
+        # most recently won, same as before.
+        bar = 960 * 4
+        win = bar * 2
+        a = (
+            [_note(t) for t in range(0, win, 240)]  # window 0: a wins outright
+            + [_note(win + t, pitch=54) for t in range(0, win, 480)]  # window 1: tie
+        )
+        b = [_note(win + t, pitch=57) for t in range(0, win, 480)]  # window 1: tie
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        _, choices = blend_tracks({0: a, 1: b}, [0, 1], sections)
+        winners = [c["track"] for c in choices]
+        assert winners[0] == 0  # window 0: a wins outright
+        assert winners[1] == 1  # window 1: isolated tie -> alternates away from a
 
 
 class TestMapper:
@@ -100,7 +190,13 @@ class TestMapper:
         assert len(notes) == 1
         assert notes[0].sustain == 2 * CHART_RESOLUTION  # two quarters, no trim needed
 
-    def test_chord_lanes_adjacent_max_three_wide(self):
+    def test_chord_lanes_interval_spread_max_three_wide(self):
+        # Root-to-2nd interval is 7 semitones (P5) -> gap=2, so the first
+        # two distinct pitches skip a lane. A 3rd distinct pitch only ever
+        # adds 1 more lane beyond that (not another full interval gap) -
+        # matches a real charter's convention of compressing power-chord
+        # voicings with octave doublings to a 2-gap shape, not spreading
+        # every distinct pitch by its own interval.
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
             _note(0, pitch=47, string=2, fret=5, chord_id=0),
@@ -111,7 +207,7 @@ class TestMapper:
         assert len(notes) == 1
         lanes = notes[0].lanes
         assert len(lanes) == 3  # capped
-        assert lanes == list(range(lanes[0], lanes[0] + 3))  # adjacent
+        assert lanes[1] - lanes[0] == 2 and lanes[2] - lanes[1] == 1
         assert max(lanes) <= 4
 
     def test_flags_and_sustain_threshold(self):
@@ -271,18 +367,24 @@ class TestChordDisjoint:
     def _lanes(self, pitches):
         return _chord_lanes_sequence([tuple(sorted(pitches))])[0]
 
-    def test_close_chord_stays_contiguous(self):
-        # Matches test_chord_lanes_adjacent_max_three_wide's real spacing.
-        lanes = self._lanes([40, 47, 52])
+    def test_tight_interval_chord_stays_adjacent(self):
+        # m2/M2/m3/M3 intervals (<=4 semitones) -> gap=1, adjacent lanes.
+        lanes = self._lanes([40, 43, 46])  # gaps 3, 3 (both m3)
         assert lanes == list(range(lanes[0], lanes[0] + 3))
 
-    def test_exactly_one_octave_apart_is_not_disjoint(self):
-        lanes = self._lanes([40, 52])  # gap == 12
-        assert lanes[1] - lanes[0] == 1  # still adjacent, not gapped
-
-    def test_more_than_one_octave_apart_is_disjoint(self):
-        lanes = self._lanes([40, 53])  # gap == 13
+    def test_power_chord_interval_is_gapped(self):
+        lanes = self._lanes([40, 47])  # gap == 7 semitones (P5)
         assert lanes[1] - lanes[0] == 2  # one empty lane between them
+
+    def test_octave_interval_reduces_mod_12_to_adjacent(self):
+        # An exact octave (12 semitones) reduces mod-12 to 0 -> same
+        # tight-interval bucket as a unison, so it stays adjacent.
+        lanes = self._lanes([40, 52])  # gap == 12 semitones (octave)
+        assert lanes[1] - lanes[0] == 1
+
+    def test_minor_seventh_interval_is_gapped_widest(self):
+        lanes = self._lanes([40, 51])  # gap == 11 semitones (m7)
+        assert lanes[1] - lanes[0] == 4  # widest gap
 
     def test_repeated_chord_shape_reuses_its_lanes(self):
         # Same repeat-stability guarantee as single notes: an identical

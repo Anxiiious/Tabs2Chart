@@ -73,12 +73,14 @@ single-note contour) crowded several nearby-but-distinct chord shapes
 into the same 1-2 lanes, because whichever shape happened to memoize
 first in a fast chord progression "claimed" a spot the later shapes'
 leap math kept landing near too. Within one chord, its own distinct
-pitches are laid out starting from its rank-assigned base lane with a
-gap whenever two adjacent pitches are more than an octave apart (a
-"disjoint" voicing, e.g. a two-hand tapped octave) - adjacent lanes
-should mean "these pitches are close together," capped at 3 lanes wide
-(game plan rule 3's cap). Exact-repeat chord shapes are memoized and replayed
-verbatim, same rationale as single notes.
+pitches are laid out starting from its rank-assigned base lane, spaced
+by harmonic interval (`_interval_to_gap`, ported from the Copilot/Fable
+M4 chord-spacing redesign): tight intervals (m2-M3) stay adjacent, wider
+ones (P4/P5, i.e. power chords, and beyond) spread across skipped lanes
+- so a power chord reads as visibly wider than a tight cluster instead
+of both collapsing to the same adjacent-lane shape - capped at 3 lanes
+wide (game plan rule 3's cap). Exact-repeat chord shapes are memoized
+and replayed verbatim, same rationale as single notes.
 
 Tick conversion: IR is 960 ticks/quarter (PyGuitarPro convention),
 .chart is emitted at Resolution=192, so every position/length divides
@@ -117,9 +119,25 @@ HAND_POSITION_SEMITONES = 4
 # _hand_position_lanes for the within-group rank-order rule).
 SEMITONES_PER_LANE = 3
 
-# Chord pitches (sorted) more than an octave apart get a lane gap instead
-# of stacking contiguous - adjacent lanes should mean "close together."
-DISJOINT_CHORD_SEMITONES = 12
+def _interval_to_gap(semitones: int) -> int:
+    """Map a chord interval (semitones) to a chart lane gap (1-4).
+
+    Tight intervals (m2/M2/m3/M3) stay on close lanes; wider ones
+    (P4/P5 - i.e. power chords) and beyond spread across skipped
+    lanes, rather than always sitting adjacent. Ported from the
+    Copilot/Fable M4 chord-spacing redesign: adjacent-only spacing made
+    power chords (root+P5) look identical to tight clusters (root+m2),
+    losing the harmonic-width information a player relies on to read
+    chord shapes at a glance.
+    """
+    semitones = abs(semitones) % 12
+    if semitones <= 4:   # m2, M2, m3, M3
+        return 1
+    if semitones <= 7:   # P4, P5 (power chords land here)
+        return 2
+    if semitones <= 9:   # m6, M6
+        return 3
+    return 4              # m7, M7, octave
 
 # The target lane a group's rank-order spread is centered on, by default
 # (the very first group, and after any leap - see _hand_position_lanes).
@@ -185,36 +203,53 @@ def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
     return min(tunings, key=tunings.get)
 
 
+def _chord_offsets(pitches: tuple[int, ...]) -> list[int]:
+    """Lane offsets (from the root's lane) for a chord's DISTINCT pitches
+    (capped to the lowest 3, per game plan rule 3), spaced by harmonic
+    interval via `_interval_to_gap` rather than always-adjacent: a power
+    chord (root+P5) should look wider on the neck than a tight cluster
+    (root+m2), so a reader can tell chord shapes apart at a glance. Spans
+    over 4 lanes are proportionally compressed back to fit (root and
+    tightest-fit outer note pinned to 0 and 4).
+
+    A 3rd distinct pitch only ever adds 1 more lane beyond the root-to-2nd
+    gap, never a further full gap - confirmed against a real charter
+    (Angevil, "Sick or Sane"): every 3-4 note power-chord voicing there
+    (root+5th, plus octave doublings) is charted as a 2-lane shape, not
+    the 4-lane spread the uncapped per-interval formula would produce -
+    real charts read a chord's 3rd+ note as "one more button", not
+    another full harmonic gap."""
+    distinct = sorted(set(pitches))[:3]
+    if len(distinct) == 1:
+        return [0]
+    offsets = [0, _interval_to_gap(distinct[1] - distinct[0])]
+    if len(distinct) == 3:
+        offsets.append(offsets[-1] + 1)
+    span = offsets[-1]
+    if span > 4:
+        if len(distinct) == 2:
+            offsets = [0, 4]
+        else:
+            mid = max(1, min(3, round(offsets[1] * 4 / span)))
+            offsets = [0, mid, 4]
+    return offsets
+
+
 def _chord_width_lanes(pitches: tuple[int, ...]) -> int:
     """How many lanes (beyond the root's own lane) a chord's own internal
     voicing needs - the widest span its distinct pitches (capped to 3,
-    per game plan rule 3) require, gapped for disjoint pairs."""
-    distinct = sorted(set(pitches))[:3]
-    if len(distinct) == 1:
-        return 0
-    steps = [
-        2 if (distinct[i] - distinct[i - 1]) > DISJOINT_CHORD_SEMITONES else 1
-        for i in range(1, len(distinct))
-    ]
-    return min(sum(steps), 4)
+    per game plan rule 3) require, per the interval-spread gap rule."""
+    return _chord_offsets(pitches)[-1]
 
 
 def _chord_internal_lanes(pitches: tuple[int, ...], base_lane: int) -> dict[int, int]:
     """Lay a chord's DISTINCT pitches (sorted) starting at base_lane, one
-    step per adjacent pair, gapped by 2 lanes instead of 1 for a disjoint
-    pair (> 1 octave apart). Capped to the lowest 3 distinct pitches -
-    any pitch beyond that has no entry in the returned map."""
+    interval-spread gap per adjacent pair (see `_interval_to_gap`). Capped
+    to the lowest 3 distinct pitches - any pitch beyond that has no entry
+    in the returned map."""
     distinct = sorted(set(pitches))[:3]
-    if len(distinct) == 1:
-        return {distinct[0]: base_lane}
-    lanes = [base_lane]
-    lane = base_lane
-    for i in range(1, len(distinct)):
-        gap = distinct[i] - distinct[i - 1]
-        step = 2 if gap > DISJOINT_CHORD_SEMITONES else 1
-        lane = min(4, lane + step)
-        lanes.append(lane)
-    return dict(zip(distinct, lanes))
+    offsets = _chord_offsets(pitches)
+    return {pitch: base_lane + offset for pitch, offset in zip(distinct, offsets)}
 
 
 def _group_chords_into_hand_positions(
