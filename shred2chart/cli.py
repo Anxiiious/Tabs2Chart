@@ -253,7 +253,7 @@ def convert_song(
             tracks_notes, track_ids, blend_spans, overrides=parsed_overrides or None
         )
 
-    chart_notes = mapper.map_notes(blended)
+    chart_notes = mapper.map_notes(blended, sections)
 
     on_progress(f"\n{len(sections)} section(s), {len(blended)} notes"
                 f"{'' if track is not None else ' after blending'}, "
