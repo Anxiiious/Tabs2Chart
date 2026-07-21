@@ -198,6 +198,73 @@ class TestMapper:
         assert len(mapped) == 3
         assert mapped[0].lanes == mapped[1].lanes == mapped[2].lanes
 
+    def test_cursor_resync_does_not_drift_over_long_progression(self):
+        # Stress test for the resync mechanism in _assign_group_lanes
+        # (contour._lane_cursor += chosen_anchor_lane - anchor_preferred_lane):
+        # an adversarial ~250-chord progression (long ascending/descending
+        # runs, a plateau, a rest >= 1 bar, a section-marker reset, and a
+        # zig-zag) that forces frequent scoring overrides of the raw
+        # cursor's preferred anchor lane. Compares the actual anchor lane
+        # chosen for each chord against a baseline built by running the
+        # exact same anchor-pitch/tick/reset sequence through map_notes as
+        # single notes (k=1, the byte-for-byte-unchanged path with zero
+        # chord-scoring override) -- i.e. what the raw wraparound cursor
+        # alone would have produced.
+        #
+        # If resync compounded (each override nudging the *next* one
+        # further in the same direction), the gap between actual and
+        # baseline would grow as the run progresses. It structurally can't:
+        # future step sizes come only from real pitch intervals, never
+        # from the cursor's current absolute value, so every resync is a
+        # one-time phase-shift, not an accumulating error term. Assert
+        # that empirically: the back half of the run isn't measurably
+        # worse than the front half.
+        notes = []
+        anchor_pitches = []
+        ticks = []
+        section_ticks = []
+        tick = 0
+        pitch = 40
+
+        def emit(p, t):
+            notes.append(_note(t, pitch=p, string=1, fret=5))
+            notes.append(_note(t, pitch=p + 7, string=2, fret=7))
+            anchor_pitches.append(p)
+            ticks.append(t)
+
+        for _ in range(80):  # long ascending run
+            emit(pitch, tick)
+            pitch += 2
+            tick += 960
+        tick += 3840 + 10  # rest >= 1 bar: triggers the existing auto-reset
+        for _ in range(60):  # long descending run, bigger steps
+            emit(pitch, tick)
+            pitch -= 3
+            tick += 960
+        for _ in range(30):  # plateau: identical chord repeated
+            emit(pitch, tick)
+            tick += 960
+        tick += 960
+        section_ticks.append(tick)  # explicit phrase-boundary reset
+        for i in range(60):  # ascending run with periodic octave leaps
+            emit(pitch, tick)
+            pitch += 12 if i % 10 == 9 else 2
+            tick += 960
+
+        mapped = map_notes(notes, section_ticks=section_ticks)
+        assert len(mapped) == len(anchor_pitches)
+        actual_lanes = [min(n.lanes) for n in mapped]
+
+        baseline_notes = [_note(t, pitch=p, string=1, fret=5) for p, t in zip(anchor_pitches, ticks)]
+        baseline = map_notes(baseline_notes, section_ticks=section_ticks)
+        baseline_lanes = [n.lanes[0] for n in baseline]
+
+        deltas = [a - b for a, b in zip(actual_lanes, baseline_lanes)]
+        half = len(deltas) // 2
+        front_mean = sum(abs(d) for d in deltas[:half]) / half
+        back_mean = sum(abs(d) for d in deltas[half:]) / (len(deltas) - half)
+        assert back_mean <= front_mean + 1.0  # no systematic growth over the run
+
     def test_open_chug_chord_keeps_all_notes(self):
         # Chord containing a fret-0 note on the chug string plus two
         # fretted notes: all three should survive as distinct lanes
