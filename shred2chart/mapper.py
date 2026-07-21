@@ -76,6 +76,19 @@ _REST_RESET_TICKS = IR_TICKS_PER_QUARTER * 4  # 1 bar
 _RECENT_SHAPES = 4   # how many past chord shapes count as "recently used"
 _TREND_WINDOW = 4    # how many past anchor pitches the direction trend spans
 
+# _rank_chord_shape's weights, named so future playtest tuning is a constant
+# edit here, not a hunt through the scoring logic. Unconfirmed heuristic
+# values, same status as _interval_to_step's semitone-bucketing thresholds
+# — expect these to move once real chord-bearing charts get playtested.
+_WEIGHT_ANCHOR = 3.0              # matches the raw wraparound cursor position
+_WEIGHT_HARMONIC_CHANGE = 2.0     # shape differs when the chord's content did
+_WEIGHT_UNPINNED = 2.0            # doesn't repeat a floor/ceiling-pinned shape
+_WEIGHT_READABLE = 0.5            # contiguous span
+_WEIGHT_RECENT_REPEAT = -0.5      # matches a shape used a couple of chords ago
+_WEIGHT_UNJUSTIFIED_REPEAT = -3.0  # exact previous shape, content changed
+_WEIGHT_CONTRARY_JUMP = -2.0      # anchor moves against the established direction
+_WEIGHT_STABILITY = 3.0           # exact previous shape, content unchanged
+
 _logger = logging.getLogger(__name__)
 
 
@@ -250,6 +263,16 @@ def _rank_chord_shape(
     is descending/flat/ascending (see `_assign_group_lanes`'s trend-window
     computation, not just the immediately previous pitch — a single
     passing dip in an otherwise-ascending run shouldn't read as a reversal).
+
+    This is a bounded local optimization — each chord is ranked only
+    against the immediately previous shape and a short recent-shape
+    history, never against future chords. That's a deliberate trade-off
+    for determinism and O(1)-per-chord performance, not an oversight: a
+    global search (look-ahead/backtracking over the whole phrase) could
+    in principle avoid every non-adjacent repeat in a long run, but at
+    real complexity cost for a readability difference unlikely to matter
+    on an actual Clone Hero highway. See the module docstring's honest
+    accounting of what this trade-off does and doesn't guarantee.
     """
     breakdown: dict[str, float] = {}
     anchor_lane = candidate[0]
@@ -260,13 +283,13 @@ def _rank_chord_shape(
     # already cursor % 5 (wraparound-correct), so matching it *is* the
     # wrap-aware continuation — this is where chord wraparound comes from.
     if direction != 0 and anchor_lane == anchor_preferred_lane:
-        breakdown["anchor"] = 3.0
+        breakdown["anchor"] = _WEIGHT_ANCHOR
 
     # Registers as harmonically different from the previous shape, but
     # only when the chord's pitch content actually changed — a real
     # repeat must not be penalized for keeping its shape.
     if content_changed and prev_lanes is not None and set(candidate) != set(prev_lanes):
-        breakdown["harmonic_change"] = 2.0
+        breakdown["harmonic_change"] = _WEIGHT_HARMONIC_CHANGE
 
     # Avoids repeating a shape that was already pinned at the floor/
     # ceiling while the phrase is still actively moving that direction —
@@ -279,7 +302,7 @@ def _rank_chord_shape(
             elif direction < 0 and min(prev_lanes) == 0 and min(candidate) == 0:
                 pinned_repeat = True
         if not pinned_repeat:
-            breakdown["unpinned"] = 2.0
+            breakdown["unpinned"] = _WEIGHT_UNPINNED
 
     # A contiguous span reads more cleanly than a scattered one, all else
     # equal. Weighted well below the other criteria on purpose: adjacency
@@ -288,17 +311,17 @@ def _rank_chord_shape(
     # as a de facto rule (there is explicitly no such requirement).
     span = max(candidate) - min(candidate) + 1
     if span == len(candidate):
-        breakdown["readable"] = 0.5
+        breakdown["readable"] = _WEIGHT_READABLE
 
     # Small nudge against oscillating back onto a shape used a couple of
     # chords ago, independent of the exact-previous-repeat check below.
     if candidate in recent_lanes:
-        breakdown["recent_repeat"] = -0.5
+        breakdown["recent_repeat"] = _WEIGHT_RECENT_REPEAT
 
     # No musical justification for an identical shape when the chord's
     # content is meaningfully different.
     if content_changed and prev_lanes is not None and candidate == prev_lanes:
-        breakdown["unjustified_repeat"] = -3.0
+        breakdown["unjustified_repeat"] = _WEIGHT_UNJUSTIFIED_REPEAT
 
     # Abrupt jump contrary to the established direction. Wrap-vs-jump is
     # disambiguated using anchor_preferred_lane: if the cursor's own
@@ -316,7 +339,7 @@ def _rank_chord_shape(
             or (direction < 0 and raw_delta > 0 and not wrap_expected)
         )
         if contrary:
-            breakdown["contrary_jump"] = -2.0
+            breakdown["contrary_jump"] = _WEIGHT_CONTRARY_JUMP
 
     # Derived, not a literal rubric line: when the chord's content is
     # truly unchanged, pull toward keeping the exact same shape. Without
@@ -324,7 +347,7 @@ def _rank_chord_shape(
     # stability (the criteria above are all gated on direction != 0 or
     # content_changed), which would leave repeats to an unreliable tiebreak.
     if content_unchanged and prev_lanes is not None and candidate == prev_lanes:
-        breakdown["stability"] = 3.0
+        breakdown["stability"] = _WEIGHT_STABILITY
 
     return sum(breakdown.values()), breakdown
 
@@ -431,7 +454,20 @@ def _assign_group_lanes(
     # Resync the persistent cursor to the lane the chord actually used
     # (scoring may have picked a different anchor lane than the raw
     # cursor value for the sake of variety/readability) so a later single
-    # note continues from there, not from the stale raw value.
+    # note continues from there, not from the stale raw value. This makes
+    # the emitted lane authoritative for future calculations, not just a
+    # display-time correction of the raw cursor.
+    #
+    # This does not accumulate: `chosen_anchor_lane` and
+    # `anchor_preferred_lane` are both already-wrapped values in 0-4, so
+    # the delta applied here is bounded to [-4, 4] on every single chord,
+    # not a running error term that grows over a long solo. Each resync
+    # is a one-time, bounded correction reflecting one real choice: the
+    # next `raw_lane()` call reads out `cursor % 5`, which is exactly
+    # `chosen_anchor_lane` plus whatever the next pitch's own interval
+    # step adds — same mechanism as a lone note, no compounding drift.
+    # The existing reset triggers (section marker, rest >= 1 bar) already
+    # provide the periodic hard boundary a from-scratch design would add.
     contour._lane_cursor += chosen_anchor_lane - anchor_preferred_lane
 
     contour._last_group_lanes = tuple(lanes[id(n)] for n in fretted)

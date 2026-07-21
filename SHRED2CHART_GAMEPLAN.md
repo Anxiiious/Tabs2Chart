@@ -348,6 +348,40 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
     invariant (what the new tests assert) held up as the honestly-supportable claim; a stronger
     "globally unique shapes" guarantee is not what this heuristic provides and the tests don't claim
     it.
+- 2026-07-21 — **PR #8 review follow-up (external review pass, no correctness issues found —
+  "solid point to merge," remaining concerns were refinement, not correctness).** Three items were
+  raised; all three addressed with documentation/refactoring, no behavior change (62 tests still
+  pass, identical output):
+  - **Scoring weights buried as literals in `_rank_chord_shape`** — extracted into eight named
+    module-level constants (`_WEIGHT_ANCHOR`, `_WEIGHT_HARMONIC_CHANGE`, `_WEIGHT_UNPINNED`,
+    `_WEIGHT_READABLE`, `_WEIGHT_RECENT_REPEAT`, `_WEIGHT_UNJUSTIFIED_REPEAT`,
+    `_WEIGHT_CONTRARY_JUMP`, `_WEIGHT_STABILITY`), same convention already used for
+    `_RECENT_SHAPES`/`_TREND_WINDOW`. A fuller `@dataclass ShapeWeights` config object was suggested
+    as a longer-term direction but not built now — it edges toward the "policy object" pattern the
+    original handoff explicitly asked to avoid, and named constants already deliver the actual
+    ask (tuning becomes editing a number, not hunting through scoring logic).
+  - **Long ascending `k=2` runs producing non-adjacent repeats** — reviewer agreed this isn't a bug
+    (eliminating it needs look-ahead/backtracking/DP over future chords, real complexity for a
+    readability difference unlikely to matter on an actual highway) and asked for one sentence
+    framing it as a deliberate trade-off rather than an oversight. Added to `_rank_chord_shape`'s
+    docstring: this is a bounded local optimization (each chord scored only against the previous
+    shape + a short recent-shape window, never a global search), a deliberate trade-off for
+    determinism and O(1)-per-chord cost.
+  - **Cursor resync drift** — reviewer's question was whether `contour._lane_cursor += (chosen -
+    preferred)` risks compounding error over a long chord-heavy solo. Analysis: it doesn't —
+    `chosen_anchor_lane` and `anchor_preferred_lane` are both already-wrapped values in 0-4, so the
+    delta applied is bounded to `[-4, 4]` on every single chord, a one-time correction reflecting
+    one real choice, not an accumulating error term (mathematically this already *is* the
+    reviewer's own suggested "observed cursor becomes the logical cursor" approach, just expressed
+    as a bounded `+=` instead of an absolute set). The existing reset triggers (section marker,
+    rest >= 1 bar) already provide the periodic hard boundary a from-scratch design would add.
+    Documented inline at the resync site rather than restructured, since no redesign was needed.
+  - **Backlog, not implemented this session:** a `tests/` regression corpus (single notes, dyads,
+    triads, staircase runs, repeated chords, awkward spreads — one fixture file + expected lane
+    output each) so future heuristic tweaks can be checked against "did this actually improve
+    something" rather than eyeballing. Real value once weight-tuning against playtest feedback
+    starts in earnest; premature before any real chord-bearing file has been tried (still an open
+    question below). Logged here so it isn't lost, not built speculatively ahead of that need.
 
 ---
 
@@ -399,6 +433,14 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
   architecture for pluggable chord rules (explicitly rejected by the handoff — keep the existing
   procedural-function style of `mapper.py`, no DI, no plugin architecture). See Current State for
   the full implementation writeup and the honest scope of what the new tests do/don't guarantee.
+- 2026-07-21 — **`_rank_chord_shape`'s weights: named module-level constants, not a `ShapeWeights`
+  config dataclass.** An external PR review suggested a config-object direction for easier future
+  tuning. Took the named-constants half of that suggestion (matches the file's existing
+  `_RECENT_SHAPES`/`_TREND_WINDOW` convention, delivers the actual ask — tuning is now editing a
+  number, not hunting through scoring logic) but not the dataclass — a config object crosses closer
+  into the "policy object" territory the original chord-mapper handoff explicitly asked to avoid,
+  and nothing about the current single-caller, single-config-instance usage needs the extra
+  indirection. Revisit if a real need for multiple weight profiles (e.g. per-genre tuning) shows up.
 
 ---
 
@@ -441,3 +483,10 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
 - Closed 2026-07-21, N/A: RBN's Trill/Tremolo lane markers are a Rock Band MIDI-engine-specific
   mechanic with no equivalent in the `.chart` text format this project emits. No action needed.
 - New (2026-07-20): `ghost_note` in `ir_gpif.py` is now implemented as `"GhostNote" in props` (inferred from the GPIF property naming pattern), but has not been verified against a real file that carries a ghost note. If a real file turns up and `ghost_note` is always `False` despite visible ghost notes in the tab, check whether GP7 uses a different property name (e.g. at the beat level, or under a different `<Property name=...>` key) and fix accordingly.
+- New (2026-07-21), backlog: a dedicated `mapper.py` regression corpus (`single_notes/`, `dyads/`,
+  `triads/`, `staircase_runs/`, `repeated_chords/`, `awkward_spreads/` — synthetic IR fixtures each
+  paired with expected lane output) was suggested during PR #8 review, so future weight/heuristic
+  tweaks to `_rank_chord_shape` can be checked against "did this actually improve something" instead
+  of eyeballing individual test assertions. Not built yet — real payoff starts once weight-tuning
+  against actual playtest feedback begins, and that in turn needs the still-open "real chord-bearing
+  file" playtest above. Revisit together with that.
