@@ -1,8 +1,6 @@
 """Tests for the blend -> map -> emit pipeline (M2/M3)."""
 from __future__ import annotations
 
-import pytest
-
 from shred2chart.blend import blend_tracks
 from shred2chart.chart_writer import build_chart
 from shred2chart.mapper import CHART_RESOLUTION, map_notes
@@ -165,14 +163,41 @@ class TestMapper:
         assert len(mapped) == 2
         assert all(len(n.lanes) == 2 for n in mapped)
 
-    @pytest.mark.xfail(
-        reason="KNOWN UNRESOLVED: placeholder chord-lane branch in "
-        "_assign_group_lanes anchors extra chord notes off the first "
-        "assigned lane in the group, which can be OPEN_NOTE (7) when the "
-        "chug rule fires — the fretted notes then collide and dedupe. "
-        "Flagged for review; do not silently fix.",
-        strict=True,
-    )
+    def test_ascending_chord_progression_avoids_ceiling_lock(self):
+        # Six power chords marching up the neck (fret > 0, not on the
+        # chug string, so this exercises real k=2 chord-shape scoring,
+        # not the single-note contour path). Two invariants matter here:
+        # consecutive shapes must never repeat (the progression keeps
+        # moving instead of collapsing onto one pair), and the shapes
+        # must not just monotonically pile up and stay pinned at the
+        # ceiling for the rest of the run — the concrete "Blue+Orange,
+        # Blue+Orange" flattening bug from the handoff.
+        notes = []
+        for i, root in enumerate([40, 42, 44, 46, 48, 50]):
+            notes += [
+                _note(i * 960, pitch=root, string=1, fret=5, chord_id=i),
+                _note(i * 960, pitch=root + 7, string=2, fret=7, chord_id=i),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 6
+        shapes = [tuple(n.lanes) for n in mapped]
+        assert all(shapes[i] != shapes[i - 1] for i in range(1, len(shapes)))
+        assert any(max(shape) < 4 for shape in shapes[3:])  # not pinned at the ceiling forever
+
+    def test_real_repeated_chord_keeps_same_shape(self):
+        # Same power chord (fret > 0, k=2) struck three times in a row:
+        # identical pitch content must keep an identical lane shape, not
+        # just for the k=1 chug-bypass case covered elsewhere.
+        notes = []
+        for i in range(3):
+            notes += [
+                _note(i * 960, pitch=40, string=1, fret=5, chord_id=i),
+                _note(i * 960, pitch=47, string=2, fret=7, chord_id=i),
+            ]
+        mapped = map_notes(notes)
+        assert len(mapped) == 3
+        assert mapped[0].lanes == mapped[1].lanes == mapped[2].lanes
+
     def test_open_chug_chord_keeps_all_notes(self):
         # Chord containing a fret-0 note on the chug string plus two
         # fretted notes: all three should survive as distinct lanes

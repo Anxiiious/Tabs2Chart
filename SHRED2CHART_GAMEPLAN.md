@@ -295,6 +295,59 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
     `shred2chart convert tests/fixtures/sample.gp` (repeated pitches correctly stay on one lane).
   - Still pending: `convert` against real `.gp` files (`test_data/` absent in that environment —
     needs the user) to confirm staircasing on real solos, and the chord-placeholder decision.
+- 2026-07-21 — **Chord-mapper session: the `_assign_group_lanes` placeholder for a chord's
+  non-anchor lanes is replaced with a scored-candidate chord-shape heuristic, generalizing the
+  single-note staircase mechanism to chords** (branch `claude/chord-mapper-staircase-ven86a`, per a
+  collaborator handoff — design mandate: optimize for chart readability and directional musical
+  movement, not literal guitar fingering; no hard adjacency requirement between a chord's notes; no
+  ceiling/floor lock on ascending/descending chord progressions; enough phrase-to-phrase variety
+  that a moving progression doesn't collapse onto one repeated shape).
+  - **`shred2chart/mapper.py` changes:** two new small helpers — `_chord_shape_candidates(k)`
+    (enumerates all `C(5,k)` legal ways to place `k` fretted notes on the 5 lanes, ≤10 candidates)
+    and `_rank_chord_shape(...)` (ranks each candidate against the previous emitted chord's
+    shape/pitch content, the phrase's recent direction trend, and recently-used shapes; returns a
+    breakdown dict so `_logger.debug(...)` can show exactly why a candidate won). `_ContourTracker`
+    gained four fields (`_last_group_lanes`, `_last_group_pitches`, `_recent_group_lanes`,
+    `_recent_anchor_pitches`) that reset alongside the existing cursor-reset triggers (section
+    marker, ≥1 bar rest) — no second parallel reset mechanism. `_assign_group_lanes`'s single-note
+    path (`len(fretted) == 1`) is untouched — same `contour.raw_lane` call, same
+    `_nearest_free_lane` placement — so single-note runs are byte-for-byte unchanged; only the
+    `len(fretted) >= 2` branch changed. After a chord is placed, the persistent cursor is resynced
+    to the chosen anchor lane (`contour._lane_cursor += chosen_anchor_lane - anchor_preferred_lane`)
+    so a later single note continues from where the chord actually landed, not the raw (possibly
+    overridden) cursor value. `k > 5` (more than 5 simultaneous fretted notes) falls back to a
+    nearest-free-lane chain seeded only from lanes this loop itself assigned — a documented,
+    pre-existing, out-of-scope limitation (5 physical lanes can't uniquely fit 6+ simultaneous
+    notes either way).
+  - **Fixed as a structural side effect, not a separate fix:** the open-chug-chord bug
+    (`test_open_chug_chord_keeps_all_notes`, previously `xfail(strict=True)`) is gone — the new
+    fretted-note path only ever draws lanes from `_chord_shape_candidates` (always 0-4), never from
+    `lanes.values()` where `OPEN_NOTE=7` could leak in as a placeholder seed, which was the actual
+    root cause. The `xfail` marker was removed; the now-unused `import pytest` in
+    `tests/test_chart_pipeline.py` was removed with it (it was that decorator's only use in the
+    file).
+  - **Tests:** all pre-existing `TestMapper` tests pass unmodified. Two of them
+    (`test_different_chords_never_repeat_same_lanes`, `test_repeated_identical_chord_keeps_lanes`)
+    were found, during design, to only exercise the single-note path (their fixtures put a `fret=0`
+    note on the chug string, which the pre-existing open-note rule pulls out, leaving one fretted
+    note per group) — so they don't actually cover real `k >= 2` chord scoring. Two new tests were
+    added to cover that gap for real: `test_ascending_chord_progression_avoids_ceiling_lock` (6
+    ascending power chords, `fret > 0` so genuinely `k=2`; asserts no two consecutive shapes repeat
+    and the run isn't pinned at the ceiling for its back half) and
+    `test_real_repeated_chord_keeps_same_shape` (same `k=2` chord struck 3x, asserts identical
+    shape each time). **62 tests pass, 0 xfail.**
+  - **Design note for future tuning sessions:** the exact scoring weights (`+3`/`+2`/`+0.5`/`-0.5`/
+    `-3`/`-2` in `_rank_chord_shape`) are explicitly tunable knobs, not settled values — same status
+    as `_interval_to_step`'s semitone-bucketing thresholds. Enable `logging.DEBUG` to see every
+    candidate's rank breakdown per chord when tuning. Empirically, longer ascending `k=2` runs don't
+    always produce a strictly-monotonic staircase (some non-adjacent repeats can occur a few chords
+    apart, since a 2-note chord's ascending pair can only reach `c[0] <= 3`, so the "match the raw
+    cursor exactly" bonus goes silent once the cursor sits at 4 until it wraps past it) — this was
+    checked by actually running the code, not just hand-derivation, and the weaker
+    "never repeats the immediately preceding shape, and isn't pinned at the ceiling forever"
+    invariant (what the new tests assert) held up as the honestly-supportable claim; a stronger
+    "globally unique shapes" guarantee is not what this heuristic provides and the tests don't claim
+    it.
 
 ---
 
@@ -331,6 +384,21 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
   Hero paper's independently-derived anchor+motion+wraparound formulation). This is a correctness
   fix, not a stylistic preference — the old version was measurably wrong for any run longer than 5
   notes in one direction.
+- 2026-07-21 — **The `_assign_group_lanes` placeholder for a chord's non-anchor lanes (open since
+  the same-day contour rework above) is resolved: replaced with a scored-candidate chord-shape
+  heuristic** (`_chord_shape_candidates` + `_rank_chord_shape`). This was flagged in that same
+  session's "KNOWN UNRESOLVED ISSUE" and in Open Questions as "not a considered decision, chord
+  logic explicitly deprioritized" — it is now a considered decision. Chosen approach: enumerate
+  every legal way to place a chord's notes on the 5 lanes (there are only `C(5,k)`, ≤10) and rank
+  each by how well it continues the phrase's direction, shows harmonic change from (or stability
+  against) the previous chord, avoids re-flattening at the floor/ceiling, avoids reusing a shape
+  from a couple of chords ago, and reads as a clean (contiguous) shape — highest-ranked wins.
+  Rejected alternatives: a hard adjacency rule for chord shapes (explicitly what the prior
+  interval-spread voicing did, and explicitly what the collaborator handoff asked NOT to bring
+  back — "there should not be exactly one legal representation"); a strategy-pattern/policy-object
+  architecture for pluggable chord rules (explicitly rejected by the handoff — keep the existing
+  procedural-function style of `mapper.py`, no DI, no plugin architecture). See Current State for
+  the full implementation writeup and the honest scope of what the new tests do/don't guarantee.
 
 ---
 
@@ -362,9 +430,14 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
   collisions) is implemented (nearest-free-lane placement) but untested against any real
   chord-bearing file. A real power chord will get whatever two lanes its two pitches' contour
   cursor values land on, nudged apart if they'd collide — could look musically arbitrary on real
-  material. Needs a real playtest check. Related: `_assign_group_lanes`'s placement logic for a
+  material. Needs a real playtest check. ~~Related: `_assign_group_lanes`'s placement logic for a
   chord's 3rd+ note is an explicit placeholder, not a decision — see Current State. Known-broken
-  for open-chug chords (see the `strict=True` xfail test `test_open_chug_chord_keeps_all_notes`).
+  for open-chug chords (see the `strict=True` xfail test `test_open_chug_chord_keeps_all_notes`).~~
+  **Resolved 2026-07-21** — placeholder replaced with a scored chord-shape heuristic; the
+  open-chug-chord xfail is fixed as a structural side effect (no longer reads `OPEN_NOTE` as a
+  placement seed). See Current State and Decision Log. The "untested against a real
+  chord-bearing file" half of this question still stands — no real `.gp` playtest of chord-heavy
+  material has happened yet, only synthetic fixtures.
 - Closed 2026-07-21, N/A: RBN's Trill/Tremolo lane markers are a Rock Band MIDI-engine-specific
   mechanic with no equivalent in the `.chart` text format this project emits. No action needed.
 - New (2026-07-20): `ghost_note` in `ir_gpif.py` is now implemented as `"GhostNote" in props` (inferred from the GPIF property naming pattern), but has not been verified against a real file that carries a ghost note. If a real file turns up and `ghost_note` is always `False` despite visible ghost notes in the tab, check whether GP7 uses a different property name (e.g. at the beat level, or under a different `<Property name=...>` key) and fix accordingly.
