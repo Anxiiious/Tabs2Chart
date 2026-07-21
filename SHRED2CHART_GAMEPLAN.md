@@ -205,6 +205,96 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
   - **`ghost_note` in `ir_gpif.py`:** upgraded from always-`False` stub to `"GhostNote" in props`, following GPIF's uniform `<Property name="X"><Enable/></Property>` pattern for all boolean note flags (same pattern as `PalmMuted`, `Muted`, `Tapped`, etc.). Module docstring updated to explain the reasoning and flag the unverified status. New synthetic-fixture test confirms a note with `<Property name="GhostNote">` gets `ghost_note=True` and one without gets `False`.
   - **7-string / Drop A open-note rule:** decided (see Decision Log). §10 updated.
   - **59 tests pass** (`pytest`).
+- 2026-07-21 — **Mapper rework session: chord voicing removed, distinct-lane guarantee added,
+  contour mechanism rebuilt as a directional wraparound cursor. Drafted and researched only — NOT
+  yet run against any real file or the existing test suite** (see the execution addendum below —
+  a follow-up session in the same day applied the code, ran and rewrote the tests).
+
+  **Code changes to `shred2chart/mapper.py`:**
+  1. Chord interval-spread voicing (`_interval_to_gap`, chord-branch lane spreading, chord width
+     capping) removed entirely. It was the actual source of mapping bugs; single-note contour
+     mapping was solid. Every note — chord member or not — now goes through the same per-note lane
+     assignment path.
+  2. Distinct-lane guarantee added for notes sharing a tick (real chords, or blend-seam collisions
+     from merging tracks). Same-tick notes are grouped; lane collisions are resolved by nudging to
+     the nearest still-free lane (0-4), processed lowest-pitch-first so the anchor note claims its
+     natural spot. Different simultaneous notes can never end up silently deduped onto one lane
+     (an actual bug in the first draft of change #1, since fixed).
+  3. `_ContourTracker` rebuilt: the old version computed each note's lane from its position inside a
+     rolling min/max pitch window, which caps out on long runs — a rising scale just pins at orange
+     (lane 4) and flatlines. Replaced with an unbounded running cursor: each new distinct pitch moves
+     the cursor by a signed step (magnitude from semitone interval via `_interval_to_step`, direction
+     from interval sign); the visible lane is `cursor % 5`, producing a proper wraparound "staircase"
+     climb instead of a flatline. Cursor resets to 0 (green) on phrase boundaries (section-marker
+     tick, or a rest ≥ 1 bar) — same reset triggers as the previous version.
+
+  **Known unresolved issue in the shipped code, flagged not fixed:** in `_assign_group_lanes`, the
+  logic placing extra chord-note lanes beyond the first (anchor) note in a same-tick group is a
+  placeholder (`preferred = list(lanes.values())[0] if lanes else 0`), not a considered decision —
+  chord musical correctness is explicitly out of scope this pass. Needs real review before trusting
+  output against a genuinely chord-bearing file.
+
+  **Research/validation, with sourcing quality noted per claim:**
+  - The visual "staircase" pattern is a named, standard Clone Hero community convention called a
+    **"Ladder"** — confirmed verbatim via the official Clone Hero Wiki dictionary page
+    (https://wiki.clonehero.net/books/general-info/page/dictionary): *"A pattern that ascends or
+    descends by 2-note 'steps', resembling a ladder or stairs when laid out on the highway."*
+  - The underlying mechanism (running position + signed step + wraparound at the ceiling/floor) was
+    independently arrived at by a Berkeley MIMS capstone project, **"Tensor Hero: Generating
+    Playable Guitar Hero Charts from Any Song"** (Waissbluth, Carr, Popescu, Hu), which mined 450
+    real GH/CH charts:
+    https://www.ischool.berkeley.edu/sites/default/files/sproject_attachments/tensorhero_capstone.pdf
+    Their "note contour" model uses an anchor + motion representation, motion range **[-4, 4]**
+    (matches our step-magnitude range), with explicit wraparound when the anchor hits the top/bottom
+    of its note-plurality category. Confirms the mechanism shape; does NOT confirm our specific
+    step-size-per-semitone bucketing (`_interval_to_step`'s thresholds are still our own guess).
+  - The core **"preserve melodic motion over strict pitch consistency"** principle behind contour
+    mapping is directly confirmed, verbatim, by Rock Band Network's own authoring documentation:
+    http://docs.c3universe.com/rbndocs/index.php?title=Guitar_and_Bass_Authoring — *"Above all,
+    guitar authoring is about making the part feel right. Try to preserve melodic motion even if it
+    means breaking consistency."* Same page confirms standard gem-wrapping patterns for runs
+    exceeding 5 lanes (e.g. Green/Red/Yellow → Red/Yellow/Blue → Yellow/Blue/Orange) and confirms
+    that even "sloppy"/chaotic solos should be quantized to the grid (usually 16th, sometimes 32nd
+    notes) rather than charted loosely.
+  - **RBN's "top four lanes" guidance, checked and CORRECTED from an initial mischaracterization:**
+    the source is real (same URL above) but it's specifically a **Medium-difficulty-reduction
+    guideline** — where to place Medium's rare orange-gem exposure, using a guitar solo as one
+    example of a good "unique section" candidate — not a general rule that Expert solos should be
+    charted within lanes 1-4. Do not apply this as "avoid green during solos."
+  - **RBN's Trill (MIDI 127) / Tremolo (MIDI 126) markers, confirmed real, then confirmed
+    NOT APPLICABLE to this project.** They're a Rock Band-engine-specific mechanic (free-form lanes
+    that appear when a player alternates faster than a hardcoded 160ms threshold), tied to RB3's own
+    MIDI-based chart format. No equivalent exists in the `.chart` text format we emit — checked
+    against the YARG wiki's `notes.chart` page and Moonscraper documentation, neither describes any
+    free-form-lane concept. Clone Hero community usage of the word "Trill" (per the Wiki dictionary,
+    above) is purely a visual naming convention for an ordinary two-lane alternating pattern, encoded
+    as regular `N` note lines — nothing special in the file format. No implementation follows from
+    this; it's closed as not applicable.
+  - **Two claims from research could NOT be verified and are not being treated as sourced fact:**
+    a "cloud of sound" recommendation to prefer continuous 16th notes over sustains for chaotic
+    solos, and a claim that RBN docs explicitly recommend forcing HOPOs to preserve a flowing feel
+    during wide-timing-gap runs. Neither turned up in direct searches of the RBN/C3 docs. Not adding
+    either to the mapper or citing as sourced unless a real citation surfaces.
+
+  **Not done this session:** no code was run against any real file (`Brag.gp`, `Boundaries.gp`,
+  `Still Searching`, `Bite The Hook`) or the existing `pytest` suite. Existing unit tests asserting
+  old chord-voicing or old windowed-contour behavior are expected to fail against this version —
+  that's intentional, they assert removed/changed behavior, not a regression; they need to be
+  rewritten, not used to justify reverting the mapper.
+- 2026-07-21 — **Execution addendum (follow-up session, branch `claude/mapper-contour-wraparound-lceuej`):**
+  the drafted mapper above was applied to the repo and validated:
+  - `pytest` run: exactly the three predicted chord-voicing tests failed and were rewritten to
+    assert the new behavior (`test_chord_all_notes_kept_on_distinct_lanes`,
+    `test_power_chord_two_distinct_lanes`, `test_wide_chords_no_note_loss`). One of them was
+    actually failing via the known-unresolved `_assign_group_lanes` placeholder (an open-chug
+    chord anchors its extra notes off the OPEN_NOTE lane 7 and dedupes); per the handoff that
+    logic was NOT fixed — the broken case is captured as a `strict=True` xfail test
+    (`test_open_chug_chord_keeps_all_notes`). **59 pass, 1 xfail.**
+  - Staircase verified in code: a synthetic 12-note rising run maps 0→4, wraps to 0, keeps
+    climbing (the old tracker would flatline at 4). Fixture smoke test via
+    `shred2chart convert tests/fixtures/sample.gp` (repeated pitches correctly stay on one lane).
+  - Still pending: `convert` against real `.gp` files (`test_data/` absent in that environment —
+    needs the user) to confirm staircasing on real solos, and the chord-placeholder decision.
 
 ---
 
@@ -221,6 +311,27 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
 - 2026-07-20 — **GP6 `.gpx` BCFS/BCFZ path: keep (do not delete).** All 4 real files seen so far are GP7 zip format; the BCFS/BCFZ half of `gpx_reader.py` has never been exercised on a real file. Decision: retain it. Rationale: (a) it is already correct and fully covered by synthetic-fixture unit tests; (b) we cannot yet rule out GP6 files in the user's full library; (c) deleting and re-implementing later is more work than the small ongoing maintenance cost of a ~100-line module. Revisit only if a future audit of the whole library confirms 100% GP7 and the dead-code cost becomes worth paying.
 - 2026-07-20 — **7-string / Drop A open-note rule: apply to fret 0 on the single lowest-tuned string only.** `mapper._lowest_tuning_string` already infers open pitch as `pitch − fret` for every string and returns the one with the globally lowest open pitch. For a 7-string Drop A guitar, string 7 at fret 0 will naturally win that contest. The "lowest-two-strings chug clusters" variant was considered but rejected: a cluster of two adjacent open-string hits is already handled correctly by the chord voicing path (two simultaneous notes → interval-spread lanes); duplicating the open-note rule for the second string would require knowing in advance what the "second lowest" open pitch is, adds complexity, and has zero confirmed real-file motivation. If real playtest of Drop A material reveals the current rule is wrong, reopen then.
 
+- 2026-07-21 — **Chord interval-spread voicing (introduced 2026-07-20 as part of the M4 contour
+  pass) reversed and removed.** Root cause per direct user feedback: absolute-interval chord
+  voicing was producing bad output; single-note contour anchoring was not. Removed outright rather
+  than debugged — every note (including chord members) now goes through the same per-note lane
+  assignment, with same-tick collisions resolved generically (nearest free lane) instead of voiced
+  by musical interval. Logged as a reversal per this doc's own mandate: the 2026-07-20 entry
+  describing `_interval_to_gap`-based chord voicing is superseded. (Note: the 2026-07-20
+  open-note-rule decision's rationale referenced "the chord voicing path"; that path no longer
+  exists, but the decision itself — fret 0 on the single lowest-tuned string only — stands
+  unchanged.)
+- 2026-07-21 — **Contour tracker mechanism changed from windowed min/max proportional mapping
+  (built 2026-07-20) to a directional wraparound cursor.** The windowed version caps lane assignment
+  at the window's pitch extremes, flatlining long rising/falling runs at the ceiling/floor lane
+  instead of producing the "Ladder"/staircase pattern real charts use. New mechanism: unbounded
+  running cursor, advanced by a signed step per note-to-note interval, read out via `cursor % 5`,
+  resetting to 0 on phrase boundaries (unchanged trigger conditions). Validated as matching real
+  charting convention both by name (Clone Hero Wiki's "Ladder" pattern) and by mechanism (Tensor
+  Hero paper's independently-derived anchor+motion+wraparound formulation). This is a correctness
+  fix, not a stylistic preference — the old version was measurably wrong for any run longer than 5
+  notes in one direction.
+
 ---
 
 ## 10. Open Questions
@@ -233,4 +344,27 @@ Each milestone's verification step is mandatory before checking it off. M2 espec
 - ~~New (2026-07-17): is the whole Sheet Happens library GP7 (zip) format, or a mix of GP6 (`.gpx`) and GP7/8?~~ **Decision made 2026-07-20** — keep BCFS/BCFZ code regardless, pending a full library audit. See Decision Log.
 - ~~What do the `<Slide><Flags>` integer values in GPIF actually mean, bit for bit?~~ **Resolved 2026-07-17** — cross-checked against editor-on-fire's GP importer, which documents the GP5+ bitmask (1/2/4/8/16/32). See Current State. **Further confirmed 2026-07-17**: `Still Searching` contains flags {1, 2, 4, 20, 32}; 20 = 16+4 is a bit *combination*, which only works if these are genuine bitmask values. Considered closed.
 - New (2026-07-17): which track is "the lead guitar" isn't always obvious — sometimes it's clearly named (`Lead Guitar` vs `Rhythm Guitar`), sometimes it's ambiguous (3 tracks all named `Overdriven Guitar` in `Brag.gp`). `dump-ir --track N` punts this decision to the user for now; Stage 4/M1 wrap-up should decide whether picking a track can be automated (e.g. "most technique flags" or "highest average pitch") or should just always ask.
+- New (2026-07-21): step-size bucketing (`_interval_to_step`: semitone gap → lane-step magnitude
+  1-4) remains our own unconfirmed heuristic. RBN's "preserve motion over consistency" principle is
+  now sourced-confirmed (see Current State) and supports the *general direction* of prioritizing
+  flow over literal pitch, but does not specify or confirm any particular step-sizing algorithm.
+  A hypothesis that real charters force a flat 1-lane-per-note step for detected monotonic runs
+  (3+ notes, same direction), reserving proportional sizing for disjunct/leap motion, is still
+  unconfirmed by any source found so far — would need a real chart example or a more explicit
+  citation to promote past hypothesis. Not implemented; would require a new run-detection pre-pass
+  that doesn't currently exist in `mapper.py`.
+- Resolved 2026-07-21: phrase-boundary reset always sets the cursor to 0 (green), regardless of the
+  new phrase's direction. Considered settled — real-guitar fretting-hand-anchoring convention (the
+  low anchor stays low regardless of phrase direction; higher notes are a temporary reach off that
+  anchor) supports the current always-reset-to-green behavior. No change made. Confidence: moderate
+  (reasoning is sound but not drawn from a chart-authoring source specifically).
+- New (2026-07-21): same-tick lane-collision handling for genuine chords (as opposed to blend-seam
+  collisions) is implemented (nearest-free-lane placement) but untested against any real
+  chord-bearing file. A real power chord will get whatever two lanes its two pitches' contour
+  cursor values land on, nudged apart if they'd collide — could look musically arbitrary on real
+  material. Needs a real playtest check. Related: `_assign_group_lanes`'s placement logic for a
+  chord's 3rd+ note is an explicit placeholder, not a decision — see Current State. Known-broken
+  for open-chug chords (see the `strict=True` xfail test `test_open_chug_chord_keeps_all_notes`).
+- Closed 2026-07-21, N/A: RBN's Trill/Tremolo lane markers are a Rock Band MIDI-engine-specific
+  mechanic with no equivalent in the `.chart` text format this project emits. No action needed.
 - New (2026-07-20): `ghost_note` in `ir_gpif.py` is now implemented as `"GhostNote" in props` (inferred from the GPIF property naming pattern), but has not been verified against a real file that carries a ghost note. If a real file turns up and `ghost_note` is always `False` despite visible ghost notes in the tab, check whether GP7 uses a different property name (e.g. at the beat level, or under a different `<Property name=...>` key) and fix accordingly.
