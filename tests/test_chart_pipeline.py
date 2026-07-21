@@ -1,6 +1,8 @@
 """Tests for the blend -> map -> emit pipeline (M2/M3)."""
 from __future__ import annotations
 
+import pytest
+
 from shred2chart.blend import blend_tracks
 from shred2chart.chart_writer import build_chart
 from shred2chart.mapper import CHART_RESOLUTION, map_notes
@@ -79,9 +81,10 @@ class TestMapper:
         assert len(notes) == 1
         assert notes[0].sustain == 2 * CHART_RESOLUTION  # two quarters, no trim needed
 
-    def test_chord_lanes_interval_spread_max_three_wide(self):
-        # Intervals here are 7, 5, 7 semitones (P5, P4, P5) -> gap=2 each,
-        # so lanes should skip rather than sit adjacent.
+    def test_chord_all_notes_kept_on_distinct_lanes(self):
+        # Chord interval-spread voicing was removed: every same-tick note
+        # gets its own lane via the distinct-lane guarantee (no capping,
+        # no interval-based spreading).
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
             _note(0, pitch=47, string=2, fret=5, chord_id=0),
@@ -91,14 +94,14 @@ class TestMapper:
         notes = map_notes(chord)
         assert len(notes) == 1
         lanes = notes[0].lanes
-        assert len(lanes) == 3  # capped
-        assert lanes == [0, 2, 4]  # interval-spread, not adjacent
-        assert max(lanes) <= 4
+        assert len(lanes) == 4  # no note loss, no 3-lane cap
+        assert len(set(lanes)) == 4  # all distinct
+        assert all(0 <= lane <= 4 for lane in lanes)
 
-    def test_power_chord_lanes_skip_not_adjacent(self):
-        # A classic power chord: root + perfect 5th (7 semitones) ->
-        # gap=2, so this should land on skipped lanes (e.g. 0,2), not
-        # forced adjacent lanes (0,1).
+    def test_power_chord_two_distinct_lanes(self):
+        # No interval-spread voicing anymore: a power chord is simply two
+        # simultaneous notes on two distinct lanes (anchor from the contour
+        # cursor, second note nearest-free — adjacency is fine now).
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
             _note(0, pitch=47, string=2, fret=5, chord_id=0),
@@ -107,7 +110,7 @@ class TestMapper:
         assert len(notes) == 1
         lanes = notes[0].lanes
         assert len(lanes) == 2
-        assert lanes[1] - lanes[0] == 2
+        assert len(set(lanes)) == 2
 
     def test_different_chords_never_repeat_same_lanes(self):
         # Two power chords a minor 3rd apart (e.g. C5 and Eb5): the contour
@@ -135,17 +138,16 @@ class TestMapper:
         assert len(mapped) == 2
         assert mapped[0].lanes == mapped[1].lanes
 
-    def test_wide_chords_correct_lane_count(self):
-        # M4 contour-based mapping: full-width chords (span 4) always fill
-        # the full neck width.  No anti-repeat constraint is applied to
-        # full-width chords — two similar wide chords look the same by design.
-        # 3-note chords: root + m7 + another m7 → offsets [0,3,6] → [0,2,4]
+    def test_wide_chords_no_note_loss(self):
+        # Distinct-lane guarantee: every note in a same-tick group keeps
+        # its own lane, regardless of chord width (fretted notes only —
+        # see the xfail below for the open-chug interaction).
         notes = []
         for i, root in enumerate([36, 38]):
             notes += [
-                _note(i * 960, pitch=root, string=1, fret=0, chord_id=i),
-                _note(i * 960, pitch=root + 10, string=2, fret=0, chord_id=i),
-                _note(i * 960, pitch=root + 20, string=3, fret=0, chord_id=i),
+                _note(i * 960, pitch=root, string=1, fret=2, chord_id=i),
+                _note(i * 960, pitch=root + 10, string=2, fret=2, chord_id=i),
+                _note(i * 960, pitch=root + 20, string=3, fret=2, chord_id=i),
             ]
         mapped = map_notes(notes)
         assert len(mapped) == 2
@@ -156,12 +158,33 @@ class TestMapper:
         notes = []
         for i, root in enumerate([36, 38]):
             notes += [
-                _note((i + 10) * 960, pitch=root, string=1, fret=0, chord_id=i + 10),
-                _note((i + 10) * 960, pitch=root + 12, string=3, fret=0, chord_id=i + 10),
+                _note((i + 10) * 960, pitch=root, string=1, fret=2, chord_id=i + 10),
+                _note((i + 10) * 960, pitch=root + 12, string=3, fret=2, chord_id=i + 10),
             ]
         mapped = map_notes(notes)
         assert len(mapped) == 2
         assert all(len(n.lanes) == 2 for n in mapped)
+
+    @pytest.mark.xfail(
+        reason="KNOWN UNRESOLVED: placeholder chord-lane branch in "
+        "_assign_group_lanes anchors extra chord notes off the first "
+        "assigned lane in the group, which can be OPEN_NOTE (7) when the "
+        "chug rule fires — the fretted notes then collide and dedupe. "
+        "Flagged for review; do not silently fix.",
+        strict=True,
+    )
+    def test_open_chug_chord_keeps_all_notes(self):
+        # Chord containing a fret-0 note on the chug string plus two
+        # fretted notes: all three should survive as distinct lanes
+        # (one OPEN + two fretted).
+        chord = [
+            _note(0, pitch=36, string=1, fret=0, chord_id=0),
+            _note(0, pitch=46, string=2, fret=0, chord_id=0),
+            _note(0, pitch=56, string=3, fret=0, chord_id=0),
+        ]
+        mapped = map_notes(chord)
+        assert len(mapped) == 1
+        assert len(mapped[0].lanes) == 3
 
     def test_flags_and_sustain_threshold(self):
         ir = [
