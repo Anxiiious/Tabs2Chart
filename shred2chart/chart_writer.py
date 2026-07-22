@@ -33,6 +33,11 @@ def _sync_track_lines(tempo_events: list[dict[str, Any]]) -> list[str]:
             if denominator == 4:
                 lines.append(f"  {tick} = TS {event['numerator']}")
             else:
+                if denominator <= 0 or (denominator & (denominator - 1)) != 0:
+                    raise ValueError(
+                        f"time signature denominator must be a positive power of two, "
+                        f"got {denominator} (tick {event['tick']})"
+                    )
                 exponent = denominator.bit_length() - 1
                 lines.append(f"  {tick} = TS {event['numerator']} {exponent}")
     return lines
@@ -63,6 +68,10 @@ def compute_song_length_ms(
 ) -> int:
     """Estimate song length in milliseconds from the last chart note.
 
+    This is a chart-duration estimate, not a measurement of the actual
+    audio file — callers that need the real playback length should prefer
+    the audio file's own duration when one is available.
+
     Converts the last note's chart tick back to wall-clock time using the
     tempo map.  Returns 0 if there are no notes or no tempo information.
     """
@@ -83,6 +92,16 @@ def compute_song_length_ms(
     from .mapper import _to_chart_ticks as _tc  # noqa: PLC0415 (local import ok here)
 
     ms = 0.0
+    # Tempo events are usually preceded by one at tick 0, but that's an
+    # invariant of the source file, not something this function enforces —
+    # if the first event starts later, the tempo it declares is assumed to
+    # apply retroactively back to tick 0 rather than silently dropping that
+    # span from the total.
+    first_start_tick = _tc(tempos[0]["tick"])
+    if first_start_tick > 0:
+        ms_per_tick = 60_000.0 / (tempos[0]["bpm"] * CHART_RESOLUTION)
+        ms += min(first_start_tick, last_tick) * ms_per_tick
+
     for i, ev in enumerate(tempos):
         start_tick = _tc(ev["tick"])
         end_tick = _tc(tempos[i + 1]["tick"]) if i + 1 < len(tempos) else last_tick
@@ -115,6 +134,10 @@ def build_chart(
         f'  Name = "{safe_title}"',
         f'  Artist = "{safe_artist}"',
         f'  Charter = "{safe_charter}"',
+        # Same offset_ms value also becomes song.ini's `delay` (in ms) below.
+        # Whether Clone Hero applies both, prefers one, or double-applies the
+        # delay if both are present is an open question — see the game
+        # plan's Open Questions for the sign/unit verification this needs.
         f"  Offset = {offset_ms / 1000}",
         f"  Resolution = {CHART_RESOLUTION}",
         '  MusicStream = "song.ogg"',
@@ -143,6 +166,8 @@ def build_song_ini(
         f"name = {safe_title}",
         f"artist = {safe_artist}",
         f"charter = {safe_charter}",
+        # Same offset_ms value as notes.chart's `Offset` (in seconds) above —
+        # two independently-interpreted sync controls from one source value.
         f"delay = {offset_ms}",
         "diff_guitar = -1",
     ]
@@ -164,7 +189,12 @@ def write_song_folder(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     chart_text = build_chart(title, artist, tempo_events, sections, chart_notes, offset_ms, charter)
-    song_length_ms = compute_song_length_ms(chart_notes, tempo_events)
+    # Offset shifts every chart tick's real playback time by offset_ms, so
+    # the last note's real-world position — and therefore the reported
+    # song length — moves with it too.
+    song_length_ms = compute_song_length_ms(chart_notes, tempo_events) + offset_ms
+    if song_length_ms < 0:
+        song_length_ms = 0
     (out_path / "notes.chart").write_text(chart_text, encoding="utf-8")
     (out_path / "song.ini").write_text(
         build_song_ini(title, artist, offset_ms, charter, song_length_ms),

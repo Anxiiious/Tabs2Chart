@@ -17,6 +17,7 @@ import pytest
 from shred2chart.gpx_reader import (
     SECTOR_SIZE,
     GpxFormatError,
+    _MAX_GPIF_SIZE,
     decompress_bcfz,
     extract_gpif,
     read_gpx_bytes,
@@ -154,3 +155,67 @@ def test_extract_gpif_from_zip_container(tmp_path):
 def test_read_gpx_bytes_rejects_unknown_magic():
     with pytest.raises(GpxFormatError):
         read_gpx_bytes(b"\xde\xad\xbe\xef" + b"\0" * 20)
+
+
+def test_unpack_bcfs_rejects_out_of_range_block_index():
+    # A single-sector payload (sector 0 only) whose index sector claims a
+    # block far beyond what the payload actually contains.
+    payload = bytearray(2 * SECTOR_SIZE)  # sector 0 (superblock) + sector 1 (index)
+    index_off = SECTOR_SIZE
+    struct.pack_into("<i", payload, index_off, 2)  # marker: index sector
+    name = b"score.gpif"
+    payload[index_off + 4:index_off + 4 + len(name)] = name
+    struct.pack_into("<i", payload, index_off + 0x8C, SECTOR_SIZE)  # file_size
+    struct.pack_into("<i", payload, index_off + 0x94, 999999)  # bogus block index
+    with pytest.raises(GpxFormatError, match="out-of-range block"):
+        unpack_bcfs(bytes(payload))
+
+
+def test_decompress_bcfz_rejects_implausible_declared_length():
+    # A tiny payload declaring an absurdly large decompressed size must be
+    # rejected up front rather than driving an unbounded allocation.
+    payload = struct.pack("<i", 10**9) + b"\x00" * 8
+    with pytest.raises(GpxFormatError, match="implausible"):
+        decompress_bcfz(payload)
+
+
+def test_extract_gpif_rejects_oversized_zip_entry(tmp_path, monkeypatch):
+    # Build a real (tiny) zip so zipfile.is_zipfile() and the outer magic
+    # sniff succeed, then fake out just the ZipFile class the extractor
+    # uses internally so its declared entry size is implausibly large —
+    # this checks the size guard fires *before* any read/decompress of
+    # the entry, without needing an actual oversized fixture on disk.
+    import shred2chart.gpx_reader as gpx_reader_module
+
+    class _FakeInfo:
+        filename = "Content/score.gpif"
+        file_size = _MAX_GPIF_SIZE + 1
+
+        def is_dir(self):
+            return False
+
+    class _FakeZipFile:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def infolist(self):
+            return [_FakeInfo()]
+
+        def read(self, info):
+            raise AssertionError("must not read an entry whose declared size failed the guard")
+
+    real_buf = io.BytesIO()
+    with zipfile.ZipFile(real_buf, "w") as zf:
+        zf.writestr("Content/score.gpif", "<GPIF/>")
+    gp_file = tmp_path / "song.gp"
+    gp_file.write_bytes(real_buf.getvalue())
+
+    monkeypatch.setattr(gpx_reader_module.zipfile, "ZipFile", _FakeZipFile)
+    with pytest.raises(GpxFormatError, match="safety limit"):
+        extract_gpif(gp_file)

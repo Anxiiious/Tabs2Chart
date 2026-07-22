@@ -155,20 +155,30 @@ def dump_tempo_events(xml_text: str) -> list[dict[str, Any]]:
                 continue
             end_tick, end_bpm, _ = raw[i + 1]
             span = end_tick - tick_pos
-            # Use round() rather than floor division so a ramp that spans
-            # e.g. 1.5 beats maps to 2 events rather than being truncated to 1.
-            n_beats = max(1, round(span / TICKS_PER_QUARTER))
-            for beat in range(n_beats):
+            if span <= 0:
+                # Degenerate/overlapping ramp (next automation at or before
+                # this one's tick): nothing to interpolate. The following
+                # automation still emits its own event at end_tick.
+                continue
+            # Step one beat at a time but stop strictly before end_tick —
+            # a span that isn't a whole number of beats (e.g. 1.5 or 2.4)
+            # must not generate an event at or past the ramp's own
+            # endpoint, which the following automation's event already
+            # covers. frac is derived from the actual tick distance (not
+            # beat-index / beat-count), so a partial final beat still
+            # interpolates to the correct bpm rather than assuming evenly
+            # spaced full-beat samples.
+            beat = 0
+            while True:
                 t = tick_pos + beat * TICKS_PER_QUARTER
-                # Interpolation fraction 0..(<1): the ramp covers the half-open
-                # interval [start_tick, end_tick).  The endpoint BPM is emitted
-                # by the following automation's own event, so beat==n_beats
-                # (frac==1.0) is intentionally excluded from this loop.
-                frac = beat / n_beats
+                if t >= end_tick:
+                    break
+                frac = (t - tick_pos) / span
                 interp = bpm + frac * (end_bpm - bpm)
                 interp = round(interp, 6)
                 bpm_out = int(interp) if float(interp).is_integer() else interp
                 events.append({"tick": t, "type": "tempo", "bpm": bpm_out})
+                beat += 1
 
     events.sort(key=lambda e: e["tick"])
     return events

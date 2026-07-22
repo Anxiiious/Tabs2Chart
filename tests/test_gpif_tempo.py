@@ -136,6 +136,48 @@ def test_linear_ramp_produces_per_beat_events():
     assert end_events == [{"tick": ramp_end_tick, "type": "tempo", "bpm": 140}]
 
 
+def test_linear_ramp_partial_final_beat_uses_actual_tick_fraction():
+    """A ramp spanning 1.5 beats (1440 ticks) must not treat its two
+    stepped samples as evenly spaced across a rounded beat count — the
+    second sample is 960 of 1440 ticks through the ramp (frac = 2/3), not
+    halfway (frac = 1/2, what beat-index/beat-count would have given)."""
+    xml_text = GPIF_TEMPLATE.format(
+        automations=(
+            LINEAR_AUTOMATION_TEMPLATE.format(bar=0, position=0, bpm=100)
+            + AUTOMATION_TEMPLATE.format(bar=0, position=0.375, bpm=140)
+        ),
+        master_bars="".join(_bar("4/4") for _ in range(2)),
+    )
+    events = dump_tempo_events(xml_text)
+    tempos = [e for e in events if e["type"] == "tempo"]
+
+    ramp_end_tick = 1440  # 0.375 * (4 beats * 960 ticks/beat)
+    ramp_events = [e for e in tempos if e["tick"] < ramp_end_tick]
+    assert [e["tick"] for e in ramp_events] == [0, 960]
+    assert ramp_events[0]["bpm"] == 100
+    assert ramp_events[1]["bpm"] == pytest.approx(100 + (960 / 1440) * 40)
+
+    end_events = [e for e in tempos if e["tick"] == ramp_end_tick]
+    assert end_events == [{"tick": ramp_end_tick, "type": "tempo", "bpm": 140}]
+
+
+def test_linear_ramp_zero_span_emits_only_endpoint_event():
+    """If the next automation sits at the same tick as the ramp's start
+    (a zero/negative-span degenerate ramp), no stepped event should be
+    generated that lands on top of — and conflicts with — the endpoint's
+    own event at that same tick."""
+    xml_text = GPIF_TEMPLATE.format(
+        automations=(
+            LINEAR_AUTOMATION_TEMPLATE.format(bar=0, position=0, bpm=100)
+            + AUTOMATION_TEMPLATE.format(bar=0, position=0, bpm=140)
+        ),
+        master_bars="".join(_bar("4/4") for _ in range(2)),
+    )
+    events = dump_tempo_events(xml_text)
+    tempos = [e for e in events if e["type"] == "tempo"]
+    assert tempos == [{"tick": 0, "type": "tempo", "bpm": 140}]
+
+
 def test_linear_ramp_last_automation_falls_back_to_single_event():
     """A Linear=true automation with no following automation has no known
     ramp endpoint — it should produce a single instantaneous event."""

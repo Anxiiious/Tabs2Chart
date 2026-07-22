@@ -44,9 +44,14 @@ deterministic interval-mapping rule. See `_rank_chord_shape` for the exact
 criteria; enable DEBUG logging to see every candidate's score breakdown
 for a given chord.
 
-Distinct-lane guarantee: every note in a same-tick group always lands on
-its own lane (or, for open chugs, the OPEN_NOTE sentinel) — chords never
-lose notes to collisions, regardless of chord width.
+Distinct-lane guarantee: every note in a same-tick group of up to 5 fretted
+notes (plus any open chugs, which use the OPEN_NOTE sentinel) lands on its
+own lane — chords never lose notes to collisions in that range. Above 5
+fretted notes in one group there are only 5 physical lanes to place them
+on, so distinctness is no longer possible for every note; see the k > 5
+fallback in `_assign_group_lanes`, which chains additional notes onto the
+nearest free lane instead (i.e. some notes in a >5-wide chord do share a
+lane).
 
 Still retained: ties merge into sustains, open-string chug rule
 (bypasses the cursor entirely), hammer_on/pull_off -> forced flip,
@@ -132,22 +137,32 @@ def _to_chart_ticks(ir_ticks: int | float) -> int:
 
 
 def _merge_ties(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge a tied note into its immediate predecessor on the same string.
+
+    Keyed by string alone (not (string, pitch)) so that any intervening
+    attack on that string — tied or not, same pitch or not — becomes the
+    new "last note" for the string. That way a tied note can only merge
+    into the note that actually precedes it in time; it can't reach past
+    an intervening note to merge into an older, unrelated note that just
+    happens to share its pitch.
+    """
     tolerance = IR_TICKS_PER_QUARTER // 16
     merged: list[dict[str, Any]] = []
     last_by_string: dict[Any, dict[str, Any]] = {}
     for note in sorted(notes, key=lambda n: n["tick"]):
-        key = (note["string"], note["pitch"])
-        prev = last_by_string.get(key)
+        string = note["string"]
+        prev = last_by_string.get(string)
         if (
             note.get("tied")
             and prev is not None
+            and prev["pitch"] == note["pitch"]
             and abs((prev["tick"] + prev["duration_ticks"]) - note["tick"]) <= tolerance
         ):
             prev["duration_ticks"] = note["tick"] + note["duration_ticks"] - prev["tick"]
             continue
         copy = dict(note)
         merged.append(copy)
-        last_by_string[key] = copy
+        last_by_string[string] = copy
     merged.sort(key=lambda n: n["tick"])
     return merged
 
