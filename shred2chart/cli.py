@@ -367,6 +367,15 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             return 1
     else:
         track_ids = _guess_guitar_tracks(tracks)
+        if len(track_ids) > 1 and not args.interactive:
+            names_preview = dict(tracks)
+            print(
+                f"warning: no --tracks given; auto-selected {len(track_ids)} "
+                f"guitar-like tracks to blend: "
+                f"{', '.join(f'{t} ({names_preview[t]})' for t in track_ids)}. "
+                "Pass --tracks to pick explicitly if this isn't what you want.",
+                file=sys.stderr,
+            )
 
     names = dict(tracks)
     if args.interactive:

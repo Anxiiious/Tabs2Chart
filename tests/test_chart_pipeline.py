@@ -1,9 +1,11 @@
 """Tests for the blend -> map -> emit pipeline (M2/M3)."""
 from __future__ import annotations
 
+import pytest
+
 from shred2chart.blend import blend_tracks
-from shred2chart.chart_writer import build_chart
-from shred2chart.mapper import CHART_RESOLUTION, map_notes
+from shred2chart.chart_writer import build_chart, compute_song_length_ms
+from shred2chart.mapper import CHART_RESOLUTION, ChartNote, map_notes
 
 IR_QUARTER = 960  # IR ticks per quarter note
 
@@ -78,6 +80,25 @@ class TestMapper:
         notes = map_notes(ir)
         assert len(notes) == 1
         assert notes[0].sustain == 2 * CHART_RESOLUTION  # two quarters, no trim needed
+
+    def test_tied_note_does_not_merge_across_intervening_attack(self):
+        # A(tick=0, dur=480) ends at tick 480. B is a distinct, non-tied
+        # attack on the SAME string at tick 500 (a different pitch). C
+        # arrives at tick 520 — within tie tolerance of A's end (480) but
+        # NOT B's immediate successor timing-wise — marked tied and
+        # matching A's pitch. A naive (string, pitch)-keyed lookup would
+        # skip right over B (different pitch key) and merge C into the
+        # stale A, discarding the fact that B ever happened. It must not:
+        # C should end up a distinct note, since B — not A — is the note
+        # that actually precedes it on that string.
+        ir = [
+            _note(0, pitch=40, string=1, fret=5, duration=480),
+            _note(500, pitch=44, string=1, fret=9, duration=20),
+            _note(520, pitch=40, string=1, fret=5, duration=480, tied=True),
+        ]
+        notes = map_notes(ir)
+        assert [n.tick for n in notes] == [0, 100, 104]
+        assert notes[0].sustain == 0  # NOT extended past the intervening attack
 
     def test_chord_all_notes_kept_on_distinct_lanes(self):
         # Chord interval-spread voicing was removed: every same-tick note
@@ -336,3 +357,56 @@ class TestChartWriter:
         )
         assert r'Name = "Song \"With\" Quotes"' in text
         assert r'Artist = "Artist\\With\\Backslash"' in text
+
+    def test_rejects_non_power_of_two_denominator(self):
+        ir = [_note(0, pitch=40, fret=5)]
+        chart_notes = map_notes(ir)
+        with pytest.raises(ValueError, match="power of two"):
+            build_chart(
+                title="Test",
+                artist="Test",
+                tempo_events=[
+                    {"tick": 0, "type": "time_signature", "numerator": 4, "denominator": 6},
+                ],
+                sections=[],
+                chart_notes=chart_notes,
+            )
+
+
+class TestSongLength:
+    def test_accounts_for_time_before_first_tempo_event(self):
+        # First tempo event starts at chart tick 200 (IR tick 1000), not 0.
+        # The 200 chart ticks before it must not be silently dropped from
+        # the reported length -- they're assumed to run at that first
+        # tempo's bpm, same as everything after it until the next change.
+        tempo_events_with_lead_in = [{"tick": 1000, "type": "tempo", "bpm": 120}]
+        tempo_events_at_zero = [{"tick": 0, "type": "tempo", "bpm": 120}]
+
+        last_tick = 400
+        chart_notes = [ChartNote(tick=last_tick, lanes=[0], sustain=0)]
+
+        with_lead_in = compute_song_length_ms(chart_notes, tempo_events_with_lead_in)
+        at_zero = compute_song_length_ms(chart_notes, tempo_events_at_zero)
+        # Both tempo maps play at the same bpm for the entire span up to
+        # last_tick, so they must report the same length -- the lead-in
+        # version must not have lost the [0, 200) span before its first event.
+        assert with_lead_in == at_zero
+
+    def test_zero_when_no_notes_or_tempo(self):
+        assert compute_song_length_ms([], []) == 0
+        assert compute_song_length_ms([ChartNote(tick=0, lanes=[0], sustain=0)], []) == 0
+
+    def test_written_song_ini_length_includes_offset(self, tmp_path):
+        from shred2chart.chart_writer import write_song_folder
+
+        ir = [_note(0, pitch=40, fret=5, duration=IR_QUARTER)]
+        chart_notes = map_notes(ir)
+        tempo_events = [{"tick": 0, "type": "tempo", "bpm": 120}]
+        base_length = compute_song_length_ms(chart_notes, tempo_events)
+
+        out_dir = write_song_folder(
+            tmp_path / "song", "Title", "Artist", tempo_events, [], chart_notes,
+            offset_ms=500,
+        )
+        ini_text = (out_dir / "song.ini").read_text(encoding="utf-8")
+        assert f"song_length = {base_length + 500}" in ini_text

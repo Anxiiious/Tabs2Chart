@@ -149,6 +149,51 @@ def test_quiet_suppresses_progress(tmp_path, capsys):
     assert "blending tracks" not in stdout
 
 
+_MULTI_GUITAR_GPIF = """<?xml version="1.0" encoding="utf-8"?>
+<GPIF>
+<Score><Title>Multi</Title><Artist>Someone</Artist></Score>
+<MasterTrack>
+<Automations>
+<Automation><Type>Tempo</Type><Linear>false</Linear><Bar>0</Bar><Position>0</Position>
+<Visible>true</Visible><Value>120 2</Value></Automation>
+</Automations>
+</MasterTrack>
+<Tracks>
+<Track id="0"><Name>Rhythm Guitar</Name></Track>
+<Track id="1"><Name>Lead Guitar</Name></Track>
+</Tracks>
+<MasterBars><MasterBar><Time>4/4</Time><Bars>0 1</Bars></MasterBar></MasterBars>
+</GPIF>
+"""
+
+
+def _write_gp_zip(path: Path, xml_text: str) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("Content/score.gpif", xml_text)
+
+
+def test_convert_warns_on_ambiguous_auto_selected_tracks(tmp_path, capsys):
+    # Two differently-named guitar-like tracks and no --tracks: both get
+    # auto-selected. Even though downstream note extraction will fail on
+    # this minimal fixture (no per-track Bars/Voices data), the track
+    # auto-selection warning must already have been printed by then, and
+    # it must appear even without --quiet/--json suppressing it.
+    gp_file = tmp_path / "multi.gp"
+    _write_gp_zip(gp_file, _MULTI_GUITAR_GPIF)
+    main(["convert", str(gp_file), "--out", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    assert "auto-selected 2 guitar-like tracks" in err
+    assert "Rhythm Guitar" in err and "Lead Guitar" in err
+
+
+def test_convert_no_warning_when_tracks_given_explicitly(tmp_path, capsys):
+    gp_file = tmp_path / "multi.gp"
+    _write_gp_zip(gp_file, _MULTI_GUITAR_GPIF)
+    main(["convert", str(gp_file), "--out", str(tmp_path / "out"), "--tracks", "0,1"])
+    err = capsys.readouterr().err
+    assert "auto-selected" not in err
+
+
 def test_convert_section_resets_contour(tmp_path):
     """Notes after the section boundary should get fresh lane assignments."""
     out = tmp_path / "output"
