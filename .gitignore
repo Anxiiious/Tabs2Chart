@@ -12,6 +12,7 @@ venv/
 test_data/*
 !test_data/.gitkeep
 songs/
+output/
 
 # Local ffmpeg binary distribution (optional, used by `convert --audio`/
 # `--album-art` if present) - a third-party binary redistribution, not
@@ -21,3 +22,9 @@ songs/
 # Reference/example .sng files a user drops in for comparison - personal
 # music library content, not project source (see test_data/ above).
 *.sng
+
+# Generated Clone Hero song folders produced locally while testing
+# conversions - not project source.
+Senses Fail - Can't Be Saved (Neversoft)/
+Senses Fail - Can't Be Saved (oBLINKxONCEo)/
+Senses Fail - Sick or Sane (Fifty for a Twenty) (Angevil)/

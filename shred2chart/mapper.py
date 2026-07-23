@@ -1,99 +1,61 @@
-"""IR notes -> Clone Hero 5-lane note events (Stage 4, M4 contour mapping).
+"""IR notes -> Clone Hero 5-lane note events. Directional wraparound
+contour for single notes, generalized to chords via a scored-candidate
+chord-shape heuristic; chord voicing (interval-spread) remains removed.
 
-- **Single notes are grouped into hand positions, then rank-ordered
-  within each group** (see `_group_into_hand_positions`/
-  `_hand_position_lanes`): consecutive notes within `HAND_POSITION_SEMITONES`
-  of each other form one group (a real guitarist doesn't shift hand
-  position for every note); within a group, DISTINCT pitches are ranked
-  by pitch and spread across consecutive lanes centered on the group's
-  target lane, so every genuinely different fret gets its own lane
-  rather than being rounded into a shared bucket. This replaced an
-  earlier per-note proportional-distance formula (v1-v3; see
-  SHRED2CHART_GAMEPLAN.md's 2026-07-19 entries) after a real playtest
-  found it still clustered a descending chug run (7-5-4-5-4-2 frets)
-  onto just 2 lanes - the rank-order-within-group design fixes this by
-  construction: it looks at the WHOLE group's distinct pitches at once,
-  not one proportional step at a time.
-- **Between groups, the next group's target lane comes from a
-  proportional leap** from the previous group's anchor (same
-  `SEMITONES_PER_LANE` formula as v2), always re-centering to
-  `CENTER_LANE` afterward so the next group has headroom on both sides
-  (same rationale as v3's error-leak/re-center fixes).
-- **A same-lane collision at a group boundary is nudged away** (the
-  group's lanes shift by 1, preserving its internal rank spacing) when
-  the first note of a new group would otherwise land on the exact same
-  lane as the last note of the previous group despite a different pitch
-  - confirmed against 4 real HOPO collisions and a real picked
-  descending chug run in "Still Searching" track 1 (v4/v5).
-- **Exact-repeat hand-position groups are memoized and replayed
-  verbatim**: the first time an exact sequence of pitches is seen as one
-  group, its final (post-nudge) lane sequence is cached; every later
-  occurrence of that exact same pitch sequence reuses the cached lanes
-  outright, skipping fresh leap/nudge computation entirely. This is
-  necessary because real songs commonly reprise earlier material across
-  section boundaries (e.g. a chorus riff returning in a later section)
-  - recomputing from scratch each time can drift by a constant lane
-  offset depending on what happens to precede that occurrence, breaking
-  the "same riff always looks the same" property. Confirmed against
-  real repeats in "Still Searching" track 1: a 40-note riff recurs
-  between sections [C]/[D] and the [A'] reprise; a wide lead lick recurs
-  between [E] and [A'] many times. Memoization is intentionally
-  unconditional (never re-nudged on replay) even on the rare occasion a
-  memoized group's first note would otherwise collide with whatever
-  precedes it that particular time - "the same riff looks the same every
-  time" was judged more important than avoiding that rarer, smaller
-  collision (2 such cases found in the real file).
-- **Ties merge into sustains** (the EOF-confirmed behavior): a note with
-  `tied: True` extends the previous note at the same string+pitch
-  instead of becoming a new attack.
-- **Open-string chugs -> open note (N 7)**: fret 0 on the track's
-  lowest-tuned string. The tuning is inferred from the notes themselves
-  (pitch - fret = the string's tuning), so drop tunings work without
-  any tuning metadata.
-- **Technique flags**: hammer_on/pull_off -> forced flip (`N 5`),
-  tap -> tap modifier (`N 6`, which overrides HOPO per the spec).
+CORE CHANGE (single notes): the old _ContourTracker computed each note's
+lane from its absolute position inside a min/max pitch window. That caps
+out — a long rising run just pins at lane 4 (orange) and flatlines, which
+is not how real charts handle scale runs/solos. Real charts treat lane
+position as RELATIVE motion: each step up moves the cursor up a lane; hit
+the ceiling (4) and the next upward step wraps back to 0 and keeps
+climbing — a moving window sliding up (or down) the neck, not a static
+5-lane cap. This is the "staircase"/"Ladder" pattern seen in every fast
+scalar run on a real chart (confirmed as a named community convention via
+the Clone Hero Wiki; the underlying anchor+motion+wraparound mechanism is
+also independently used in the Tensor Hero chart-generation research
+paper, motion range [-4,4], matching ours).
 
-Chord voicing uses the SAME grouping/rank-order/memoize design as single
-notes (see `_group_chords_into_hand_positions`/`_rank_order_chord_roots`/
-`_chord_lanes_sequence`): chords are grouped by root pitch into hand
-positions the same way single notes are - but with a ROLLING anchor
-(compare each chord's root to the PREVIOUS chord's root, not the
-group's first root), since a gradual chord-progression walk (every step
-small, but the group's start and end far apart) needs to stay one group
-for the rank-order spread below to see the whole progression at once
-(confirmed necessary on a real progression, "Still Searching" track 1
-section [F]: roots 56-57-59-61-62, every step <=4 semitones but a total
-span of 6 - a fixed-first-root anchor split this partway through). A
-group's DISTINCT chord roots are then rank-ordered and spread evenly
-across the lane range still available after reserving room for the
-widest chord's own internal voicing - not each chord independently
-computing a leap off the previous one. An earlier per-chord leap+memo
-design (keyed on absolute root-to-root leaps, analogous to a v1-era
-single-note contour) crowded several nearby-but-distinct chord shapes
-into the same 1-2 lanes, because whichever shape happened to memoize
-first in a fast chord progression "claimed" a spot the later shapes'
-leap math kept landing near too. Within one chord, its own distinct
-pitches are laid out starting from its rank-assigned base lane, spaced
-by harmonic interval (`_interval_to_gap`, ported from the Copilot/Fable
-M4 chord-spacing redesign): tight intervals (m2-M3) stay adjacent, wider
-ones (P4/P5, i.e. power chords, and beyond) spread across skipped lanes
-- so a power chord reads as visibly wider than a tight cluster instead
-of both collapsing to the same adjacent-lane shape - capped at 3 lanes
-wide (game plan rule 3's cap). Exact-repeat chord shapes are memoized
-and replayed verbatim, same rationale as single notes.
+Mechanism:
+- `_lane_cursor` is a running integer position, NOT clamped to 0-4.
+- Each new distinct pitch moves the cursor by a signed step (bigger
+  intervals = bigger steps, direction from sign of the interval).
+- The visible lane is `_lane_cursor % 5` — this is what gives the wrap.
+- Repeated identical pitch: interval is 0, cursor doesn't move, same lane.
+- Phrase boundary (section marker or rest >= 1 bar) resets the cursor
+  to 0 (green) — a fresh run always starts climbing from the bottom,
+  matching real-guitar fretting-hand ergonomics (anchor stays low,
+  higher notes are a temporary reach off that anchor) rather than
+  anchoring high for descending phrases.
 
-Tick conversion: IR is 960 ticks/quarter (PyGuitarPro convention),
-.chart is emitted at Resolution=192, so every position/length divides
-by 5 (all common note values stay exact integers).
+CHORDS: a same-tick group's lowest-pitched note (the "anchor") advances
+the shared cursor exactly like a single note above — this is what keeps
+the cursor consistent across mixed chord/single-note runs. The rest of
+the chord's lanes come from `_chord_shape_candidates` / `_rank_chord_shape`:
+every legal way to place the chord's notes on distinct lanes is generated
+(there are only C(5,k) of them, at most 10), each is ranked by how well it
+continues the established melodic/harmonic motion, avoids re-flattening at
+the ceiling/floor, shows harmonic change from the previous chord (or keeps
+a genuinely repeated chord's shape stable instead of jittering), nudges
+away from a shape used a couple of chords ago, and reads cleanly — and the
+top-ranked shape is used. The mapper intentionally chooses among multiple
+valid chart representations of a chord; there is no single "correct" lane
+assignment for a chord, so do not "fix" this back into a single
+deterministic interval-mapping rule. See `_rank_chord_shape` for the exact
+criteria; enable DEBUG logging to see every candidate's score breakdown
+for a given chord.
 
-Note-type semantics (N 0-4 lanes, 5 forced, 6 tap, 7 open) are pinned
-from the community chart-format docs (TheNathannator's
-GuitarGame_ChartFormats), not from memory, per the game plan's mandate.
+Distinct-lane guarantee: every note in a same-tick group always lands on
+its own lane (or, for open chugs, the OPEN_NOTE sentinel) — chords never
+lose notes to collisions, regardless of chord width.
+
+Still retained: ties merge into sustains, open-string chug rule
+(bypasses the cursor entirely), hammer_on/pull_off -> forced flip,
+tap -> tap flag, sustain threshold + gap trim.
 """
 from __future__ import annotations
 
-import bisect
-import math
+import itertools
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -101,9 +63,6 @@ IR_TICKS_PER_QUARTER = 960
 CHART_RESOLUTION = 192
 _DIVISOR = IR_TICKS_PER_QUARTER // CHART_RESOLUTION  # 5
 
-# Sustain rules, in chart ticks (192/quarter): notes shorter than an
-# eighth get no sustain (CH convention); sustains are trimmed to leave
-# a 1/32-note gap before the next note.
 MIN_SUSTAIN = CHART_RESOLUTION // 2  # eighth note = 96
 SUSTAIN_GAP = CHART_RESOLUTION // 8  # 1/32 note = 24
 
@@ -111,49 +70,58 @@ OPEN_NOTE = 7
 FORCED_FLAG = 5
 TAP_FLAG = 6
 
-# Consecutive single notes within this many semitones of each other form
-# one "hand position" group (roughly a real guitarist's 4-5 fret span);
-# a bigger jump starts a new group (see _group_into_hand_positions).
-HAND_POSITION_SEMITONES = 4
+_MAX_LANE = 4  # lanes are 0-4; OPEN_NOTE(7) lives outside this range
+_REST_RESET_TICKS = IR_TICKS_PER_QUARTER * 4  # 1 bar
 
-# How many semitones of pitch movement equal one lane step, for the
-# proportional leap BETWEEN groups (not within one - see
-# _hand_position_lanes for the within-group rank-order rule).
-SEMITONES_PER_LANE = 3
+_RECENT_SHAPES = 4   # how many past chord shapes count as "recently used"
+_TREND_WINDOW = 4    # how many past anchor pitches the direction trend spans
 
-def _interval_to_gap(semitones: int) -> int:
-    """Map a chord interval (semitones) to a chart lane gap (1-4).
+# _rank_chord_shape's weights, named so future playtest tuning is a constant
+# edit here, not a hunt through the scoring logic. Unconfirmed heuristic
+# values, same status as _interval_to_step's semitone-bucketing thresholds
+# — expect these to move once real chord-bearing charts get playtested.
+_WEIGHT_ANCHOR = 3.0              # matches the raw wraparound cursor position
+_WEIGHT_HARMONIC_CHANGE = 2.0     # shape differs when the chord's content did
+_WEIGHT_UNPINNED = 2.0            # doesn't repeat a floor/ceiling-pinned shape
+_WEIGHT_READABLE = 0.5            # contiguous span
+_WEIGHT_RECENT_REPEAT = -0.5      # matches a shape used a couple of chords ago
+_WEIGHT_UNJUSTIFIED_REPEAT = -3.0  # exact previous shape, content changed
+_WEIGHT_CONTRARY_JUMP = -2.0      # anchor moves against the established direction
+_WEIGHT_STABILITY = 3.0           # exact previous shape, content unchanged
 
-    Tight intervals (m2/M2/m3/M3) stay on close lanes; wider ones
-    (P4/P5 - i.e. power chords) and beyond spread across skipped
-    lanes, rather than always sitting adjacent. Ported from the
-    Copilot/Fable M4 chord-spacing redesign: adjacent-only spacing made
-    power chords (root+P5) look identical to tight clusters (root+m2),
-    losing the harmonic-width information a player relies on to read
-    chord shapes at a glance.
+_logger = logging.getLogger(__name__)
+
+
+def _interval_to_step(semitones: int) -> int:
+    """Signed interval -> unsigned lane-step magnitude. Small stepwise
+    motion (the common case in a scale run) moves one lane per note,
+    which is what actually produces the staircase wraparound — bigger
+    leaps move further so a real interval jump still reads as a jump,
+    not just another staircase step.
+
+    NOTE: this specific bucketing (semitone thresholds -> step size) is
+    OUR OWN HEURISTIC, not confirmed against real chart data. See game
+    plan Open Questions — a run-detection pre-pass that overrides this
+    with a flat step-of-1 for detected monotonic runs has been proposed
+    but NOT implemented. Do not treat these thresholds as settled.
     """
-    semitones = abs(semitones) % 12
-    if semitones <= 4:   # m2, M2, m3, M3
+    semitones = abs(semitones)
+    if semitones == 0:
+        return 0
+    if semitones <= 4:   # half/whole step, up through a third
         return 1
-    if semitones <= 7:   # P4, P5 (power chords land here)
+    if semitones <= 7:   # up to a fifth
         return 2
-    if semitones <= 9:   # m6, M6
+    if semitones <= 9:   # sixth
         return 3
-    return 4              # m7, M7, octave
-
-# The target lane a group's rank-order spread is centered on, by default
-# (the very first group, and after any leap - see _hand_position_lanes).
-# Centering rather than an absolute-pitch-derived lane means a group has
-# headroom on both sides regardless of how many distinct pitches it
-# turns out to contain.
-CENTER_LANE = 2
+    return 4              # seventh, octave, or bigger
 
 
 @dataclass
 class ChartNote:
-    tick: int  # chart ticks (192/quarter)
-    lanes: list[int]  # 0-4, or [OPEN_NOTE]
-    sustain: int = 0  # chart ticks
+    tick: int
+    lanes: list[int]
+    sustain: int = 0
     forced: bool = False
     tap: bool = False
     source: dict = field(default_factory=dict, repr=False)
@@ -164,12 +132,6 @@ def _to_chart_ticks(ir_ticks: int | float) -> int:
 
 
 def _merge_ties(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Fold tied notes into the duration of the note they extend.
-
-    A tied note continues the previous note at the same string+pitch;
-    it must not become a new attack. Matching tolerates small gaps
-    (rounding, bar boundaries) up to a 64th note.
-    """
     tolerance = IR_TICKS_PER_QUARTER // 16
     merged: list[dict[str, Any]] = []
     last_by_string: dict[Any, dict[str, Any]] = {}
@@ -191,8 +153,6 @@ def _merge_ties(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
-    """The string whose open pitch (pitch - fret) is lowest — the chug
-    string in drop tunings."""
     tunings: dict[int, int] = {}
     for note in notes:
         if note["string"] is None or note["pitch"] is None or note["fret"] is None:
@@ -205,665 +165,358 @@ def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
     return min(tunings, key=tunings.get)
 
 
-def _chord_offsets(pitches: tuple[int, ...], max_pitches: int = 3) -> list[int]:
-    """Lane offsets (from the root's lane) for a chord's DISTINCT pitches
-    (capped to the lowest `max_pitches`, per game plan rule 3), spaced by
-    harmonic interval via `_interval_to_gap` rather than always-adjacent:
-    a power chord (root+P5) should look wider on the neck than a tight
-    cluster (root+m2), so a reader can tell chord shapes apart at a
-    glance. Spans over 4 lanes are proportionally compressed back to fit
-    (root and tightest-fit outer note pinned to 0 and 4).
+class _ContourTracker:
+    """Directional wraparound lane cursor — replaces the old min/max
+    window. `_lane_cursor` is unbounded; only the modulo at read time
+    folds it into 0-4, which is what produces the staircase wrap.
 
-    `max_pitches` defaults to 3 (game plan rule 3's cap) but a caller can
-    pass 2 to voice a chord narrower than its full harmonic content would
-    normally require - e.g. a repeating pedal-tone chord that's musically
-    a genuine 3-note voicing, but whose extra reserved lane is otherwise
-    the only thing crowding out lane separation for the actually-changing
-    chords nearby (confirmed on a real progression, "Calling All Cars"
-    track 1, section [C]: a 38-root pedal-tone chord repeats far more
-    often than any of the 4 real chord changes around it; narrowing ONLY
-    that pedal chord to root+5th frees up an extra base lane for it
-    specifically, without altering the chord-change chords' own, still
-    fully 3-note, voicings).
+    The `_last_group_*`/`_recent_*` fields extend this same persistent
+    state to chords: they hold just enough context about recently emitted
+    same-tick groups for `_rank_chord_shape` to judge motion/variety
+    without re-deriving it from the full note history. They reset
+    alongside the cursor so a fresh phrase never gets scored against a
+    chord from a different musical idea.
+    """
 
-    A 3rd distinct pitch only ever adds 1 more lane beyond the root-to-2nd
-    gap, never a further full gap - confirmed against a real charter
-    (Angevil, "Sick or Sane"): every 3-4 note power-chord voicing there
-    (root+5th, plus octave doublings) is charted as a 2-lane shape, not
-    the 4-lane spread the uncapped per-interval formula would produce -
-    real charts read a chord's 3rd+ note as "one more button", not
-    another full harmonic gap."""
-    distinct = sorted(set(pitches))[:max_pitches]
-    if len(distinct) == 1:
-        return [0]
-    offsets = [0, _interval_to_gap(distinct[1] - distinct[0])]
-    if len(distinct) == 3:
-        offsets.append(offsets[-1] + 1)
-    span = offsets[-1]
-    if span > 4:
-        if len(distinct) == 2:
-            offsets = [0, 4]
-        else:
-            mid = max(1, min(3, round(offsets[1] * 4 / span)))
-            offsets = [0, mid, 4]
-    return offsets
+    def __init__(self) -> None:
+        self._lane_cursor: int = 0
+        self._last_pitch: int | None = None
+        self._last_tick: int | None = None
+        self._last_group_lanes: tuple[int, ...] | None = None
+        self._last_group_pitches: tuple[int, ...] | None = None
+        self._recent_group_lanes: list[tuple[int, ...]] = []
+        self._recent_anchor_pitches: list[int] = []
+
+    def reset(self) -> None:
+        self._lane_cursor = 0
+        self._last_pitch = None
+        self._last_tick = None
+        self._last_group_lanes = None
+        self._last_group_pitches = None
+        self._recent_group_lanes = []
+        self._recent_anchor_pitches = []
+
+    def raw_lane(self, pitch: int, ir_tick: int) -> int:
+        """Advance the cursor for `pitch` and return its lane (0-4)."""
+        if self._last_tick is not None and ir_tick - self._last_tick >= _REST_RESET_TICKS:
+            self.reset()
+        self._last_tick = ir_tick
+
+        if self._last_pitch is None:
+            self._last_pitch = pitch
+            return self._lane_cursor % 5
+
+        interval = pitch - self._last_pitch
+        step = _interval_to_step(interval)
+        if interval > 0:
+            self._lane_cursor += step
+        elif interval < 0:
+            self._lane_cursor -= step
+        # interval == 0 (repeated pitch): cursor unchanged, same lane.
+        self._last_pitch = pitch
+        return self._lane_cursor % 5
 
 
-def _chord_width_lanes(pitches: tuple[int, ...], max_pitches: int = 3) -> int:
-    """How many lanes (beyond the root's own lane) a chord's own internal
-    voicing needs - the widest span its distinct pitches (capped to
-    `max_pitches`, per game plan rule 3) require, per the interval-spread
-    gap rule."""
-    return _chord_offsets(pitches, max_pitches)[-1]
+def _nearest_free_lane(preferred: int, taken: set[int]) -> int:
+    """Closest unused physical lane to `preferred`, 0-_MAX_LANE. This is
+    NOT circular — simultaneous notes are physical fret positions at one
+    instant, not a melodic sequence, so no wraparound here."""
+    if preferred not in taken:
+        return preferred
+    for delta in range(1, _MAX_LANE + 1):
+        for candidate in (preferred - delta, preferred + delta):
+            if 0 <= candidate <= _MAX_LANE and candidate not in taken:
+                return candidate
+    return preferred
 
 
-def _chord_internal_lanes(
-    pitches: tuple[int, ...], base_lane: int, max_pitches: int = 3
+def _chord_shape_candidates(k: int) -> list[tuple[int, ...]]:
+    """All ways to place k distinct notes on the 5 physical lanes
+    (0.._MAX_LANE), each candidate already ascending. Deliberately kept
+    independent of scoring/history — this function only enumerates what's
+    *legal* (there are only C(5,k) options, at most 10), never what's
+    *preferred*; `_rank_chord_shape` handles preference. Returns `[]` for
+    `k` outside 1..5 (5 physical lanes) — callers must fall back for
+    `k > 5`, a pre-existing, documented, out-of-scope limitation."""
+    if k < 1 or k > _MAX_LANE + 1:
+        return []
+    return list(itertools.combinations(range(_MAX_LANE + 1), k))
+
+
+def _rank_chord_shape(
+    candidate: tuple[int, ...],
+    current_pitches: tuple[int, ...],
+    prev_lanes: tuple[int, ...] | None,
+    prev_pitches: tuple[int, ...] | None,
+    recent_lanes: list[tuple[int, ...]],
+    anchor_preferred_lane: int,
+    direction: int,
+) -> tuple[float, dict[str, float]]:
+    """Rank one candidate chord shape. This expresses a PREFERENCE among
+    several musically-legitimate options, not an objective correctness
+    check (hence "rank", not "score") — there is no single right answer
+    for how to lay a chord across 5 lanes. Returns `(total, breakdown)` so
+    callers can log exactly which criteria fired, without duplicating this
+    logic in a separate explain function.
+
+    `direction` is -1/0/+1: whether the phrase's recent anchor-pitch trend
+    is descending/flat/ascending (see `_assign_group_lanes`'s trend-window
+    computation, not just the immediately previous pitch — a single
+    passing dip in an otherwise-ascending run shouldn't read as a reversal).
+
+    This is a bounded local optimization — each chord is ranked only
+    against the immediately previous shape and a short recent-shape
+    history, never against future chords. That's a deliberate trade-off
+    for determinism and O(1)-per-chord performance, not an oversight: a
+    global search (look-ahead/backtracking over the whole phrase) could
+    in principle avoid every non-adjacent repeat in a long run, but at
+    real complexity cost for a readability difference unlikely to matter
+    on an actual Clone Hero highway. See the module docstring's honest
+    accounting of what this trade-off does and doesn't guarantee.
+    """
+    breakdown: dict[str, float] = {}
+    anchor_lane = candidate[0]
+    content_changed = prev_pitches is not None and current_pitches != prev_pitches
+    content_unchanged = prev_pitches is not None and current_pitches == prev_pitches
+
+    # Continues the established staircase motion. anchor_preferred_lane is
+    # already cursor % 5 (wraparound-correct), so matching it *is* the
+    # wrap-aware continuation — this is where chord wraparound comes from.
+    if direction != 0 and anchor_lane == anchor_preferred_lane:
+        breakdown["anchor"] = _WEIGHT_ANCHOR
+
+    # Registers as harmonically different from the previous shape, but
+    # only when the chord's pitch content actually changed — a real
+    # repeat must not be penalized for keeping its shape.
+    if content_changed and prev_lanes is not None and set(candidate) != set(prev_lanes):
+        breakdown["harmonic_change"] = _WEIGHT_HARMONIC_CHANGE
+
+    # Avoids repeating a shape that was already pinned at the floor/
+    # ceiling while the phrase is still actively moving that direction —
+    # the concrete "Blue+Orange, Blue+Orange" flattening bug.
+    if direction != 0:
+        pinned_repeat = False
+        if prev_lanes is not None:
+            if direction > 0 and max(prev_lanes) == _MAX_LANE and max(candidate) == _MAX_LANE:
+                pinned_repeat = True
+            elif direction < 0 and min(prev_lanes) == 0 and min(candidate) == 0:
+                pinned_repeat = True
+        if not pinned_repeat:
+            breakdown["unpinned"] = _WEIGHT_UNPINNED
+
+    # A contiguous span reads more cleanly than a scattered one, all else
+    # equal. Weighted well below the other criteria on purpose: adjacency
+    # should win a shape a tie it already deserves on other grounds, not
+    # systematically pull the algorithm back toward "chords are adjacent"
+    # as a de facto rule (there is explicitly no such requirement).
+    span = max(candidate) - min(candidate) + 1
+    if span == len(candidate):
+        breakdown["readable"] = _WEIGHT_READABLE
+
+    # Small nudge against oscillating back onto a shape used a couple of
+    # chords ago, independent of the exact-previous-repeat check below.
+    if candidate in recent_lanes:
+        breakdown["recent_repeat"] = _WEIGHT_RECENT_REPEAT
+
+    # No musical justification for an identical shape when the chord's
+    # content is meaningfully different.
+    if content_changed and prev_lanes is not None and candidate == prev_lanes:
+        breakdown["unjustified_repeat"] = _WEIGHT_UNJUSTIFIED_REPEAT
+
+    # Abrupt jump contrary to the established direction. Wrap-vs-jump is
+    # disambiguated using anchor_preferred_lane: if the cursor's own
+    # wraparound logic expected a wrap right now, a lane-number decrease
+    # while ascending (or increase while descending) is the *correct*
+    # continuation, not a penalized jump.
+    if prev_lanes is not None and direction != 0:
+        wrap_expected = (
+            (direction > 0 and anchor_preferred_lane < prev_lanes[0])
+            or (direction < 0 and anchor_preferred_lane > prev_lanes[0])
+        )
+        raw_delta = anchor_lane - prev_lanes[0]
+        contrary = (
+            (direction > 0 and raw_delta < 0 and not wrap_expected)
+            or (direction < 0 and raw_delta > 0 and not wrap_expected)
+        )
+        if contrary:
+            breakdown["contrary_jump"] = _WEIGHT_CONTRARY_JUMP
+
+    # Derived, not a literal rubric line: when the chord's content is
+    # truly unchanged, pull toward keeping the exact same shape. Without
+    # this, a repeated multi-note chord has no criterion favoring
+    # stability (the criteria above are all gated on direction != 0 or
+    # content_changed), which would leave repeats to an unreliable tiebreak.
+    if content_unchanged and prev_lanes is not None and candidate == prev_lanes:
+        breakdown["stability"] = _WEIGHT_STABILITY
+
+    return sum(breakdown.values()), breakdown
+
+
+def _assign_group_lanes(
+    group: list[dict[str, Any]],
+    chug_string: int | None,
+    contour: _ContourTracker,
+    ir_tick: int,
 ) -> dict[int, int]:
-    """Lay a chord's DISTINCT pitches (sorted) starting at base_lane, one
-    interval-spread gap per adjacent pair (see `_interval_to_gap`). Capped
-    to the lowest `max_pitches` distinct pitches - any pitch beyond that
-    has no entry in the returned map (it's simply not charted for this
-    occurrence, e.g. a pedal-tone chord deliberately narrowed - see
-    `_chord_offsets`)."""
-    distinct = sorted(set(pitches))[:max_pitches]
-    offsets = _chord_offsets(pitches, max_pitches)
-    return {pitch: base_lane + offset for pitch, offset in zip(distinct, offsets)}
+    """Distinct lane per note in a same-tick group. Open chugs pulled out
+    first. Among the rest (the fretted notes):
 
+    - A single fretted note is placed exactly as a lone note would be —
+      the contour cursor's raw wraparound lane. This keeps single-note
+      runs (the overwhelming majority of notes) byte-for-byte unchanged.
+    - Two or more fretted notes (a chord) generalize that same staircase
+      mechanism: the lowest-pitched note still advances the shared cursor
+      (it's the "melody"/anchor note), and the full chord's lane-shape is
+      chosen by ranking every legal placement — see `_rank_chord_shape`.
+    """
+    lanes: dict[int, int] = {}
+    taken: set[int] = set()
 
-def _group_chords_into_hand_positions(
-    chords: list[tuple[int, ...]]
-) -> list[list[tuple[int, ...]]]:
-    """Split a sequence of chords into runs where each chord's root stays
-    within HAND_POSITION_SEMITONES of the PREVIOUS chord's root - a
-    rolling comparison, not a fixed first-root anchor like
-    _group_into_hand_positions, so a gradual chord-progression walk
-    (each step small, but the group's start and end far apart) stays one
-    group instead of splitting partway through. Confirmed necessary on a
-    real chord progression ("Still Searching" track 1 section [F]:
-    roots 56-57-59-61-62, every step <=4 semitones but the first-to-last
-    span is 6) - a fixed-first-root anchor split this into two groups
-    partway through, which meant the rank-order-across-the-group fix
-    only saw half the progression's roots at once and still crowded
-    several distinct chords onto the same 1-2 lanes.
-
-    A group is also cut off once it has accumulated as many distinct
-    roots as there is room for (5 lanes, minus whatever the group's
-    widest chord's own internal voicing needs to reserve) - a rolling
-    small-step anchor can otherwise "creep" a group across a much wider
-    span than any single hand position actually covers, packing more
-    distinct roots into the group than can possibly get distinct base
-    lanes (confirmed on a real progression, "Still Searching" track 1
-    section [H]: roots walk 54-57-59-61 then creep back down through
-    53-56-52-51, each step <=4 semitones but 7 distinct roots end up
-    needing to share a span that a 2-note chord's own width has already
-    narrowed to 4 lanes - rank-ordering by position alone then maps
-    several genuinely different roots onto the same lane pair, which
-    reads as "missed chord changes")."""
-    groups: list[list[tuple[int, ...]]] = []
-    current: list[tuple[int, ...]] = []
-    current_roots: set[int] = set()
-    current_max_width = 0
-    prev_root: int | None = None
-    for chord in chords:
-        root = chord[0]
-        width = _chord_width_lanes(chord)
-        next_max_width = max(current_max_width, width)
-        next_distinct = len(current_roots | {root})
-        max_distinct_roots = 5 - next_max_width
-        would_overflow = next_distinct > max_distinct_roots
-        if prev_root is None or abs(root - prev_root) > HAND_POSITION_SEMITONES or would_overflow:
-            if current:
-                groups.append(current)
-            current = [chord]
-            current_roots = {root}
-            current_max_width = width
+    fretted = []
+    for note in group:
+        if note["fret"] == 0 and note["string"] == chug_string:
+            lanes[id(note)] = OPEN_NOTE
         else:
-            current.append(chord)
-            current_roots.add(root)
-            current_max_width = next_max_width
-        prev_root = root
-    if current:
-        groups.append(current)
-    return groups
+            fretted.append(note)
 
+    fretted.sort(key=lambda n: n["pitch"] or 0)
 
-def _rank_order_chord_roots(
-    group: list[tuple[int, ...]], center_lane: float, pedal_root: int | None = None
-) -> dict[int, int]:
-    """Rank a hand-position group's DISTINCT chord roots and spread them
-    evenly across the lane range still available after reserving room
-    for the widest chord's own internal voicing, centered on center_lane
-    - so a cluster of nearby, genuinely different chord shapes (e.g. a
-    fast chord-progression run) spreads across the neck instead of each
-    independently computing a leap that can crowd several shapes into
-    the same corner (confirmed against a real chord progression, "Still
-    Searching" track 1 section [F]: 5 nearby power-chord roots all
-    landed on lanes 3-4 under the per-chord leap+memo design, since
-    several of them happened to memoize high on first occurrence).
+    if not fretted:
+        return lanes
 
-    `pedal_root`: if the group's chord(s) share this root, their width is
-    computed with `max_pitches=2` (root+5th only, dropping the 3rd
-    voiced note) instead of the usual 3 - see `_chord_offsets`."""
-    distinct_roots = sorted({chord[0] for chord in group})
-    max_width = max(
-        _chord_width_lanes(chord, 2 if chord[0] == pedal_root else 3) for chord in group
-    )
-    available_span = 4 - max_width
-    if len(distinct_roots) == 1:
-        # Clamp to [0, available_span] (the widest lane the chord's own
-        # voicing can start on without running off the highway) - but
-        # clamping a too-high center_lane DOWN to available_span, rather
-        # than preserving how close to the top of the playable range the
-        # leap was aiming for, silently erases the leap's direction: a
-        # wide chord (small available_span) leaping to center_lane=4 was
-        # landing back at the same base lane as an unrelated earlier
-        # group that leaped to center_lane=0, so two genuinely different,
-        # non-adjacent chord roots produced the identical on-screen shape
-        # (confirmed on a real progression, "Calling All Cars" track 1:
-        # roots 45 then 38 then 43, each a new group after a >4-semitone
-        # rolling-anchor leap, but 38's and 43's single-root clamps both
-        # collapsed to base lane 0/2 despite leaping to center_lane 0 and
-        # 4 respectively). Preserve directionality by clamping via the
-        # proportional position within [0, 4] instead of a hard min().
-        # Round half up (away from 0), not Python's default round-half-
-        # to-even: with a small available_span (e.g. 1, for a wide
-        # chord - only 2 possible base lanes), a banker's-rounding tie
-        # at exactly the midpoint biases DOWN toward lane 0 half the
-        # time, which happens to be the same lane a low pedal-tone chord
-        # already occupies - confirmed on a real section where two
-        # different chord roots landed exactly on that tie and both
-        # rounded down, colliding with the pedal tone's shape instead of
-        # splitting one up/one down.
-        proportional = math.floor(center_lane / 4 * available_span + 0.5) if available_span else 0
-        return {distinct_roots[0]: max(0, min(available_span, proportional))}
-    # Proportional rank position across the SMALLEST span that both fits
-    # every distinct root (spread by _chord_offsets width apart isn't
-    # required here - just distinct lanes) and can still slide toward
-    # center_lane's side of [0, available_span], not always anchored at
-    # 0 - a multi-root group anchored at 0 unconditionally claims the
-    # bottom of the range even when the overall progression is trending
-    # DOWN and this group (being early/high-pitched) should sit toward
-    # the TOP instead, leaving room below for later, lower groups
-    # (confirmed on a real descending progression, "Calling All Cars"
-    # track 1: roots 47-45-38-43 trend down, so the run should start
-    # high - but the first group's 2 roots {45,47} always spanned lanes
-    # [0,2] regardless of the lookahead-biased center_lane=4, leaving no
-    # room below lane 0 for the much-lower 38 chord that follows).
-    last = len(distinct_roots) - 1
-    # Slide the group's occupied sub-range within [0, available_span]
-    # toward center_lane's side, keeping every root's spacing at least 1
-    # lane apart (distinct_roots is safe to fit in available_span+1
-    # lanes total - see the docstring above).
-    lo = max(0, min(available_span - last, round(center_lane / 4 * (available_span - last))))
-    span = available_span - lo
-    return {
-        root: lo + round(i * span / last)
-        for i, root in enumerate(distinct_roots)
-    }
+    if len(fretted) == 1:
+        note = fretted[0]
+        preferred = contour.raw_lane(note["pitch"] or 0, ir_tick)
+        lane = _nearest_free_lane(preferred, taken)
+        lanes[id(note)] = lane
+        # Keep the trend window continuous across mixed chord/single-note
+        # runs, without touching _last_group_*/_recent_group_lanes (those
+        # track chord-to-chord shape comparisons specifically).
+        contour._recent_anchor_pitches.append(note["pitch"] or 0)
+        if len(contour._recent_anchor_pitches) > _TREND_WINDOW:
+            contour._recent_anchor_pitches.pop(0)
+        return lanes
 
+    anchor_pitch = fretted[0]["pitch"] or 0
+    current_pitches = tuple(n["pitch"] or 0 for n in fretted)
 
-def _group_chords_into_hand_positions_with_sections(
-    chords: list[tuple[int, ...]], section_ids: list[int]
-) -> tuple[list[list[tuple[int, ...]]], list[int]]:
-    """Same grouping as `_group_chords_into_hand_positions`, but also cuts
-    a group at a section boundary - a hand-position run should never
-    silently straddle two sections (e.g. verse into chorus), since the
-    lookahead bias in `_chord_lanes_sequence` needs each group's section
-    membership to be unambiguous."""
-    groups: list[list[tuple[int, ...]]] = []
-    group_section_ids: list[int] = []
-    current: list[tuple[int, ...]] = []
-    current_roots: set[int] = set()
-    current_max_width = 0
-    prev_root: int | None = None
-    prev_section: int | None = None
-    for chord, sec in zip(chords, section_ids):
-        root = chord[0]
-        width = _chord_width_lanes(chord)
-        next_max_width = max(current_max_width, width)
-        next_distinct = len(current_roots | {root})
-        max_distinct_roots = 5 - next_max_width
-        would_overflow = next_distinct > max_distinct_roots
-        if (
-            prev_root is None
-            or abs(root - prev_root) > HAND_POSITION_SEMITONES
-            or would_overflow
-            or sec != prev_section
-        ):
-            if current:
-                groups.append(current)
-                group_section_ids.append(prev_section)
-            current = [chord]
-            current_roots = {root}
-            current_max_width = width
-        else:
-            current.append(chord)
-            current_roots.add(root)
-            current_max_width = next_max_width
-        prev_root = root
-        prev_section = sec
-    if current:
-        groups.append(current)
-        group_section_ids.append(prev_section)
-    return groups, group_section_ids
+    trend_ref = contour._recent_anchor_pitches[0] if contour._recent_anchor_pitches else None
+    direction = 0 if trend_ref is None else (anchor_pitch > trend_ref) - (anchor_pitch < trend_ref)
 
+    anchor_preferred_lane = contour.raw_lane(anchor_pitch, ir_tick)
 
-def _chord_lanes_sequence(
-    chords: list[tuple[int, ...]], section_ids: list[int] | None = None
-) -> list[list[int]]:
-    """Lane for each chord in a track, in order. Nearby chords (by root,
-    within one hand position) are grouped and rank-ordered together, the
-    same way _single_note_lanes rank-orders nearby single notes - see
-    _rank_order_chord_roots and the module docstring. BETWEEN groups, the
-    next group's center lane comes from the same proportional-leap
-    formula as _single_note_lanes (off the previous group's LAST root,
-    since that's the hand position the player is actually coming from),
-    instead of every new group resetting to CENTER_LANE regardless of
-    where the song was already sitting on the neck - without this, a
-    group with only one distinct root (common: a riff sits on one power
-    chord for a while) always collapsed back to the same lane pair no
-    matter how far the song had actually moved, which is why real chord
-    progressions read as "stuck near green/red" even across big root
-    jumps between sections. Exact-repeat chord shapes are memoized and
-    replayed verbatim WITHIN one hand-position group (real riffs repeat
-    a shape many times in a row) - but the memo is scoped PER GROUP, not
-    global across the whole song: a global memo would let whichever
-    group happens to see a given chord shape first permanently lock its
-    lane for every later, unrelated occurrence, silently overriding that
-    later group's own rank-order spread (confirmed on a real
-    progression, "Still Searching" track 1 section [F]: chord (59,71)
-    first appears early in an unrelated group and memoizes to lanes
-    [3,4]; a much later group with roots 56-57-59-61 computes 59's local
-    rank-order lane as [2,3], but the global memo intercepted it first -
-    same for (61,73) and (62,74) - so 30 consecutive, genuinely
-    different chords all rendered as the same blue/orange shape)."""
-    if section_ids is None:
-        section_ids = [0] * len(chords)
-    groups, group_section_ids = _group_chords_into_hand_positions_with_sections(chords, section_ids)
+    if len(fretted) <= _MAX_LANE + 1:
+        prev_lanes = contour._last_group_lanes
+        prev_pitches = contour._last_group_pitches
 
-    lanes_seq: list[list[int]] = []
-    prev_group_last_root: int | None = None
-    section_root_lo = section_root_hi = None
-    section_pedal_root: int | None = None
+        scored = [
+            (
+                *_rank_chord_shape(
+                    c, current_pitches, prev_lanes, prev_pitches,
+                    contour._recent_group_lanes, anchor_preferred_lane, direction,
+                ),
+                c,
+            )
+            for c in _chord_shape_candidates(len(fretted))
+        ]
 
-    for gi, group in enumerate(groups):
-        # At the start of a section (gi == 0, or this group's section
-        # differs from the previous group's), look ahead at the NEAR-TERM
-        # trend WITHIN THIS SECTION ONLY (this group's root vs. the next
-        # couple of groups still in the same section) to bias where the
-        # section's first group starts, reserving headroom in the
-        # direction the roots are about to move - rather than always
-        # starting at CENTER_LANE and discovering only reactively (one
-        # group at a time) that there's no room left to keep
-        # descending/ascending. A purely backward-looking, per-group leap
-        # can only react to a collision after it happens; starting high
-        # when the run is about to descend (or low when ascending) avoids
-        # the collision entirely (confirmed on a real progression,
-        # "Calling All Cars" track 1, section [A]: roots walk 47-45-38-43,
-        # i.e. descending - starting centered left no room below lane 0
-        # for the 38 chord that follows).
-        #
-        # The lookahead is bounded to THIS SECTION, not the next couple of
-        # groups regardless of section, and not the whole song: looking
-        # past the section boundary lets an unrelated NEXT section's
-        # material (which may trend the opposite way, or trend back to
-        # ~0 net over a long span) dictate where THIS section starts,
-        # which is exactly backwards - the whole point is that a chorus
-        # returning to a high riff shouldn't make the verse before it
-        # start low just because the verse's own local trend is disguised
-        # by looking too far ahead (confirmed on the same real song: the
-        # full-track first-to-last root displacement nets to ~0 even
-        # though section [A] alone plainly descends 47-45-38-43, so a
-        # whole-track lookahead gave [A] no bias at all).
-        if gi == 0 or group_section_ids[gi] != group_section_ids[gi - 1]:
-            first_root = group[0][0]
-            same_section_groups = [
-                g
-                for g, sec in zip(groups[gi:], group_section_ids[gi:])
-                if sec == group_section_ids[gi]
-            ]
-            section_roots = [c[0] for g in same_section_groups for c in g]
-            section_root_lo, section_root_hi = min(section_roots), max(section_roots)
+        _, _, winner = max(
+            scored,
+            key=lambda item: (item[0], -abs(item[2][0] - anchor_preferred_lane), tuple(-x for x in item[2])),
+        )
 
-            # Identify a PEDAL TONE for this section: a root that occurs
-            # clearly more often than any other (a repeating low chug
-            # between real chord changes is a common riff shape). Only
-            # the pedal root's own voicing gets narrowed to root+5th (see
-            # _rank_order_chord_roots/_chord_internal_lanes below) - every
-            # other, less-repeated chord keeps its full voicing, so this
-            # never distorts the chords that are actually changing
-            # (confirmed on a real section, "Calling All Cars" track 1,
-            # section [C]: root 38 occurs 20 times vs. the next most
-            # frequent root's 10, a clear majority, so it alone gets
-            # narrowed to free up an extra base lane for it specifically).
-            root_counts: dict[int, int] = {}
-            for r in section_roots:
-                root_counts[r] = root_counts.get(r, 0) + 1
-            section_pedal_root = None
-            if len(root_counts) > 1:
-                most_common_root, most_common_count = max(root_counts.items(), key=lambda kv: kv[1])
-                second_most_count = max(
-                    c for r, c in root_counts.items() if r != most_common_root
+        if _logger.isEnabledFor(logging.DEBUG):
+            for total, breakdown, c in scored:
+                _logger.debug(
+                    "chord @ tick=%s candidate=%s rank=%.1f breakdown=%s%s",
+                    ir_tick, c, total, breakdown, " <- chosen" if c == winner else "",
                 )
-                if most_common_count > second_most_count * 1.5:
-                    section_pedal_root = most_common_root
 
-            same_section = [c[0] for g in same_section_groups[1:3] for c in g]
-            center_lane = CENTER_LANE
-            if same_section:
-                trend = same_section[-1] - first_root
-                if trend < 0:
-                    center_lane = 4  # roots trend down -> start high, room to descend
-                elif trend > 0:
-                    center_lane = 0  # roots trend up -> start low, room to ascend
-        elif section_root_hi > section_root_lo:
-            # Position THIS group's root proportionally within the WHOLE
-            # section's root range (established above, when the section
-            # started), not via a leap relative only to the immediately
-            # PREVIOUS group's root - a leap-only formula saturates when a
-            # repeating pedal-tone chord (a low chug between chord
-            # changes) keeps "resetting" the reference point every other
-            # group: every different chord that follows the pedal tone is
-            # "far" from it by roughly the same large margin, so they all
-            # clamp to the same edge lane despite being different pitches
-            # from EACH OTHER (confirmed on a real progression, "Calling
-            # All Cars" track 1, section [C]: a 38-root pedal alternates
-            # with 47/45/50/43 chord changes; every one of those 4
-            # distinct chords leaped from 38 by 5-12 semitones, all
-            # saturating the same clamped lane_delta, so all 4 different
-            # chords rendered as the identical shape). Using the
-            # section's full pitch range as the scale instead means each
-            # chord's OWN pitch determines its lane, so different chords
-            # actually land at different lanes even when they share a
-            # common pedal-tone neighbor.
-            # Keep this as a float, not rounded to an int lane yet: with a
-            # wide chord (small available_span, e.g. 1 - only 2 possible
-            # base lanes), rounding HERE to the nearest of 5 possible
-            # center_lanes and then AGAIN down to the nearest of 2 base
-            # lanes double-quantizes and can flip two roots on opposite
-            # sides of the section's true midpoint onto the SAME base
-            # lane (confirmed on the same real section: roots 43 and 45
-            # both sit just past the low side of a 0-4 center_lane
-            # rounding, so both independently rounded to center_lane=2,
-            # which then floor-rounds to base lane 0 - identical to the
-            # pedal tone's own shape - even though 45 is closer to the
-            # section's high end and 47/50 correctly reached base lane
-            # 1). _rank_order_chord_roots does the single rounding step
-            # directly from this fraction.
-            root = group[0][0]
-            center_lane = (root - section_root_lo) / (section_root_hi - section_root_lo) * 4
-        else:
-            delta = group[0][0] - prev_group_last_root
-            lane_delta = round(delta / SEMITONES_PER_LANE)
-            if lane_delta == 0:
-                lane_delta = 1 if delta > 0 else (-1 if delta < 0 else 0)
-            center_lane = max(0, min(4, CENTER_LANE + lane_delta))
-        base_lane_by_root = _rank_order_chord_roots(group, center_lane, section_pedal_root)
+        for note, lane in zip(fretted, winner):
+            lanes[id(note)] = lane
+        chosen_anchor_lane = winner[0]
+    else:
+        # k > 5: no room for a full legal-shape search (only 5 physical
+        # lanes exist). Pre-existing, documented limitation — chain off
+        # the anchor via nearest-free-lane, seeded only from lanes this
+        # loop itself assigned (never from `lanes.values()`, where
+        # OPEN_NOTE could leak in — that was the old placeholder's bug).
+        chosen_anchor_lane = _nearest_free_lane(anchor_preferred_lane, taken)
+        taken.add(chosen_anchor_lane)
+        lanes[id(fretted[0])] = chosen_anchor_lane
+        prev_lane = chosen_anchor_lane
+        for note in fretted[1:]:
+            lane = _nearest_free_lane(prev_lane, taken)
+            taken.add(lane)
+            lanes[id(note)] = lane
+            prev_lane = lane
 
-        group_memo: dict[tuple[int, ...], list[int]] = {}
-        for chord in group:
-            cached = group_memo.get(chord)
-            if cached is not None:
-                lanes_seq.append(cached)
-                continue
-            base_lane = base_lane_by_root[chord[0]]
-            max_pitches = 2 if chord[0] == section_pedal_root else 3
-            lane_map = _chord_internal_lanes(chord, base_lane, max_pitches)
-            chord_lanes = [lane_map[p] for p in chord if p in lane_map]
-            group_memo[chord] = chord_lanes
-            lanes_seq.append(chord_lanes)
-        prev_group_last_root = group[-1][0]
-    return lanes_seq
+    # Resync the persistent cursor to the lane the chord actually used
+    # (scoring may have picked a different anchor lane than the raw
+    # cursor value for the sake of variety/readability) so a later single
+    # note continues from there, not from the stale raw value. This makes
+    # the emitted lane authoritative for future calculations, not just a
+    # display-time correction of the raw cursor.
+    #
+    # This does not accumulate: `chosen_anchor_lane` and
+    # `anchor_preferred_lane` are both already-wrapped values in 0-4, so
+    # the delta applied here is bounded to [-4, 4] on every single chord,
+    # not a running error term that grows over a long solo. Each resync
+    # is a one-time, bounded correction reflecting one real choice: the
+    # next `raw_lane()` call reads out `cursor % 5`, which is exactly
+    # `chosen_anchor_lane` plus whatever the next pitch's own interval
+    # step adds — same mechanism as a lone note, no compounding drift.
+    # The existing reset triggers (section marker, rest >= 1 bar) already
+    # provide the periodic hard boundary a from-scratch design would add.
+    contour._lane_cursor += chosen_anchor_lane - anchor_preferred_lane
 
+    contour._last_group_lanes = tuple(lanes[id(n)] for n in fretted)
+    contour._last_group_pitches = current_pitches
+    contour._recent_group_lanes.append(contour._last_group_lanes)
+    if len(contour._recent_group_lanes) > _RECENT_SHAPES:
+        contour._recent_group_lanes.pop(0)
+    contour._recent_anchor_pitches.append(anchor_pitch)
+    if len(contour._recent_anchor_pitches) > _TREND_WINDOW:
+        contour._recent_anchor_pitches.pop(0)
 
-def _group_into_hand_positions(notes: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
-    """Split a sequence of (pitch, fret) single notes into runs where
-    every note stays within HAND_POSITION_SEMITONES of the PREVIOUS
-    note's FRET (a rolling anchor, not a fixed first-note anchor - same
-    rationale as the chord grouping's rolling anchor: a gradual walk
-    should stay one group even if its start and end are far apart).
-
-    Grouped by FRET, not pitch: a real guitarist's hand position is a
-    fret-span on the neck, not a pitch interval - the same fret on a
-    lower string sounds many semitones apart from a higher string, but
-    costs the hand nothing to reach (confirmed on a real lead lick,
-    "Still Searching" track 1 ticks 92000-110880: pitch 61 - a low pedal
-    tone on string 3, fret 11 - alternates against a moving voice on
-    strings 4-6, frets 9-15; every pitch delta between them is >4
-    semitones, up to 17, but the whole phrase sits in a tight 6-fret
-    span. Grouping by pitch fragmented this into ~20 one-note groups,
-    each leaping independently from a reset center lane, so several
-    different high notes collapsed onto the same clamped lane and the
-    phrase read as only two buttons repeating).
-
-    A group is also cut off once it has accumulated as many distinct
-    pitches as there is room for (5 lanes), so _rank_order_lanes always
-    has enough lanes to keep every distinct pitch in the group
-    separate."""
-    groups: list[list[tuple[int, int]]] = []
-    current: list[tuple[int, int]] = []
-    current_distinct: set[int] = set()
-    prev_fret: int | None = None
-    for note in notes:
-        pitch, fret = note
-        next_distinct = len(current_distinct | {pitch})
-        would_overflow = pitch not in current_distinct and next_distinct > 5
-        if prev_fret is None or abs(fret - prev_fret) > HAND_POSITION_SEMITONES or would_overflow:
-            if current:
-                groups.append(current)
-            current = [note]
-            current_distinct = {pitch}
-        else:
-            current.append(note)
-            current_distinct.add(pitch)
-        prev_fret = fret
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _rank_order_lanes(group: list[int], center_lane: int) -> list[int]:
-    """Rank the group's DISTINCT pitches and spread them across
-    consecutive lanes centered on center_lane, so every genuinely
-    different pitch in the group gets its own lane (not rounded into a
-    shared bucket by a per-note proportional formula)."""
-    distinct = sorted(set(group))
-    spread = min(4, len(distinct) - 1) if len(distinct) > 1 else 0
-    lo_lane = max(0, min(4 - spread, center_lane - spread // 2))
-    rank_to_lane = {pitch: lo_lane + i for i, pitch in enumerate(distinct)}
-    return [rank_to_lane[pitch] for pitch in group]
-
-
-def _single_note_lanes(notes: list[tuple[int, int]]) -> list[int]:
-    """Lane for each single (pitch, fret) note in a track, in order. See
-    the module docstring for the full rank-order + leap + memoize
-    design. Grouping uses fret (hand position); lane rank-ordering
-    within/between groups uses pitch (melodic contour) - see
-    _group_into_hand_positions."""
-    groups = _group_into_hand_positions(notes)
-    lanes: list[int] = []
-    anchor_lane = CENTER_LANE
-    prev_group_first_pitch: int | None = None
-    prev_group_last_pitch: int | None = None
-    prev_group_last_lane: int | None = None
-    # Exact-repeat memo: same pitch sequence -> same final lane sequence,
-    # regardless of what happens to precede it this time (see docstring).
-    memo: dict[tuple[int, ...], tuple[int, ...]] = {}
-
-    for gi, group in enumerate(groups):
-        pitches = [pitch for pitch, _fret in group]
-        key = tuple(pitches)
-        cached = memo.get(key)
-        if cached is not None:
-            group_lanes = list(cached)
-        elif (
-            gi > 0
-            and prev_group_last_pitch is not None
-            and prev_group_last_pitch in pitches
-        ):
-            # The previous group's LAST pitch reappears SOMEWHERE in this
-            # group (not necessarily as this group's own first note - a
-            # group split mid-riff, most often the 5-distinct-pitches
-            # overflow cap cutting a continuous alternating pattern in
-            # half, see _group_into_hand_positions, typically lands the
-            # split between the repeating anchor note and the NEXT new
-            # note, e.g. group1 ends [...,67] and group2 starts
-            # [74,67,67,76,...] - 67 is shared but isn't group2's first
-            # element). Anchor this group so that shared pitch keeps the
-            # lane it already had, instead of leaping fresh from the
-            # PREVIOUS group's FIRST pitch (which can be totally
-            # unrelated to the note actually being played right at the
-            # boundary). A fresh leap here recomputes an unrelated
-            # center_lane and rank-orders this group's OWN distinct
-            # pitches from scratch, which can flip the shared pitch onto
-            # a different lane than it just had one note earlier -
-            # reading as a random jump on the SAME repeated note
-            # (confirmed on a real riff, "Calling All Cars" track 1,
-            # ~1:10-1:20: a repeating fret-12 note at lane 3 gets
-            # overflow-split mid-repeat, and the new group's fresh
-            # leap+rank flips every later occurrence of that same note to
-            # lane 0 - the identical pitch visibly teleports lanes with
-            # no pitch change to justify it).
-            # _rank_order_lanes's own centering can't always place the
-            # anchor pitch EXACTLY on prev_group_last_lane (a wide group,
-            # e.g. 4 distinct pitches needing a 4-lane spread, only has 2
-            # valid lo_lane choices total - the anchor pitch's rank
-            # within the group fixes how far from either edge it can
-            # land). Search every achievable lo_lane directly (not via
-            # center_lane's indirection) and keep whichever puts the
-            # anchor pitch CLOSEST to its previous lane, rather than
-            # computing one candidate and discarding it entirely when a
-            # rigid shift-to-exact-match would push the group off the
-            # highway.
-            distinct = sorted(set(pitches))
-            spread = min(4, len(distinct) - 1) if len(distinct) > 1 else 0
-            anchor_rank = distinct.index(prev_group_last_pitch)
-            best_lo = min(range(0, 4 - spread + 1), key=lambda lo: abs((lo + anchor_rank) - prev_group_last_lane))
-            rank_to_lane = {pitch: best_lo + i for i, pitch in enumerate(distinct)}
-            group_lanes = [rank_to_lane[pitch] for pitch in pitches]
-            memo[key] = tuple(group_lanes)
-        else:
-            if gi == 0:
-                center_lane = CENTER_LANE
-            else:
-                delta = pitches[0] - prev_group_first_pitch
-                lane_delta = round(delta / SEMITONES_PER_LANE)
-                if lane_delta == 0:
-                    lane_delta = 1 if delta > 0 else (-1 if delta < 0 else 0)
-                center_lane = max(0, min(4, anchor_lane + lane_delta))
-            group_lanes = _rank_order_lanes(pitches, center_lane)
-
-            # Boundary nudge: if this group's first note would land on the
-            # exact same lane as the previous group's last note despite a
-            # different pitch, shift the WHOLE group by one lane (keeps
-            # its internal rank spacing intact) - computed once here, then
-            # baked into the memo, never recomputed on a later replay.
-            if (
-                prev_group_last_pitch is not None
-                and group_lanes[0] == prev_group_last_lane
-                and pitches[0] != prev_group_last_pitch
-            ):
-                direction = 1 if pitches[0] > prev_group_last_pitch else -1
-                if all(0 <= lane + direction <= 4 for lane in group_lanes):
-                    group_lanes = [lane + direction for lane in group_lanes]
-                elif all(0 <= lane - direction <= 4 for lane in group_lanes):
-                    group_lanes = [lane - direction for lane in group_lanes]
-            memo[key] = tuple(group_lanes)
-
-        lanes.extend(group_lanes)
-        anchor_lane = CENTER_LANE
-        prev_group_first_pitch = pitches[0]
-        prev_group_last_pitch = pitches[-1]
-        prev_group_last_lane = group_lanes[-1]
     return lanes
 
 
 def map_notes(
     ir_notes: list[dict[str, Any]],
-    sections: list[dict[str, Any]] | None = None,
+    section_ticks: list[int] | None = None,
 ) -> list[ChartNote]:
-    """Map a single track's (or blended) IR note list to chart notes.
-
-    `sections`: optional `[{"tick": int, ...}, ...]` section markers (IR
-    ticks, song order) from `gpif_tempo.dump_sections` - used to bound the
-    chord-lane lookahead in `_chord_lanes_sequence` to the current
-    section, not the whole song (see that function's docstring)."""
     notes = _merge_ties(ir_notes)
     chug_string = _lowest_tuning_string(notes)
-    section_ticks = sorted(s["tick"] for s in sections) if sections else []
+    section_set: set[int] = set(section_ticks or [])
 
-    # Group simultaneous notes (chords share a tick; chord_id guards
-    # against two tracks' blended notes colliding on one tick).
-    groups: dict[tuple, list[dict[str, Any]]] = {}
+    contour = _ContourTracker()
+
+    groups: dict[int, list[dict[str, Any]]] = {}
     for note in notes:
-        groups.setdefault((note["tick"], note.get("chord_id")), []).append(note)
-    ordered_groups = sorted(groups.items(), key=lambda kv: kv[0][0])
-
-    # Open-string chugs bypass lane logic entirely and don't participate
-    # in hand-position grouping; regular single notes are pulled out into
-    # their own pitch sequence so _single_note_lanes sees a continuous,
-    # uninterrupted stream to group/rank/memoize (an open note or a chord
-    # in between two single notes shouldn't count as a "leap"). Chords get
-    # the same continuous-stream treatment via _chord_lanes_sequence.
-    single_notes: list[tuple[int, int]] = []  # (pitch, fret)
-    single_note_positions: list[int] = []  # index into ordered_groups
-    chord_shapes: list[tuple[int, ...]] = []
-    chord_section_ids: list[int] = []
-    chord_positions: list[int] = []
-    for gi, ((tick, _), group) in enumerate(ordered_groups):
-        if len(group) == 1:
-            if not (group[0]["fret"] == 0 and group[0]["string"] == chug_string):
-                single_notes.append((group[0]["pitch"] or 0, group[0]["fret"] or 0))
-                single_note_positions.append(gi)
-        else:
-            chord_shapes.append(tuple(sorted(n["pitch"] or 0 for n in group)))
-            chord_section_ids.append(bisect.bisect_right(section_ticks, tick) - 1)
-            chord_positions.append(gi)
-    single_lanes = _single_note_lanes(single_notes)
-    lanes_by_position = dict(zip(single_note_positions, single_lanes))
-    chord_lanes_seq = _chord_lanes_sequence(chord_shapes, chord_section_ids)
-    lanes_by_position.update(zip(chord_positions, chord_lanes_seq))
+        groups.setdefault(note["tick"], []).append(note)
 
     chart_notes: list[ChartNote] = []
-    for gi, ((tick, _), group) in enumerate(ordered_groups):
-        if len(group) == 1 and group[0]["fret"] == 0 and group[0]["string"] == chug_string:
-            lanes = [OPEN_NOTE]
-        elif len(group) == 1:
-            lanes = [lanes_by_position[gi]]
-        else:
-            lanes = lanes_by_position[gi]
+    for ir_tick, group in sorted(groups.items()):
+        if ir_tick in section_set:
+            contour.reset()
+
+        lane_by_id = _assign_group_lanes(group, chug_string, contour, ir_tick)
         duration = max(n["duration_ticks"] for n in group)
-        source = {"ir_tick": tick}
-        if len(group) == 1:
-            source["pitch"] = group[0]["pitch"]
+        lanes = sorted(set(lane_by_id.values()))
         chart_notes.append(
             ChartNote(
-                tick=_to_chart_ticks(tick),
-                lanes=sorted(set(lanes)),
+                tick=_to_chart_ticks(ir_tick),
+                lanes=lanes,
                 sustain=_to_chart_ticks(duration),
                 forced=any(n.get("hammer_on") or n.get("pull_off") for n in group),
                 tap=any(n.get("tap") for n in group),
-                source=source,
+                source={"ir_tick": ir_tick},
             )
         )
 
-    # Collapse groups that landed on the same chart tick (blend seams,
-    # rounding): merge their lanes rather than stacking duplicates.
-    by_tick: dict[int, ChartNote] = {}
-    for note in chart_notes:
-        existing = by_tick.get(note.tick)
-        if existing is None:
-            by_tick[note.tick] = note
-        else:
-            existing.lanes = sorted(set(existing.lanes) | set(note.lanes))
-            existing.sustain = max(existing.sustain, note.sustain)
-            existing.forced = existing.forced or note.forced
-            existing.tap = existing.tap or note.tap
-    result = sorted(by_tick.values(), key=lambda n: n.tick)
+    result = sorted(chart_notes, key=lambda n: n.tick)
 
-    # Sustain policy: shorter than an eighth -> no sustain; otherwise
-    # trim to leave a gap before the next note.
     for i, note in enumerate(result):
         if i + 1 < len(result):
             note.sustain = min(note.sustain, result[i + 1].tick - note.tick - SUSTAIN_GAP)

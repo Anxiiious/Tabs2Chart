@@ -112,7 +112,7 @@ def test_dump_ir_single_notes_and_chord_and_techniques():
     assert first["pull_off"] is False
     assert first["tap"] is True
     assert first["accent"] is True
-    assert first["ghost_note"] is False  # always False: no confirmed GPIF property yet
+    assert first["ghost_note"] is False  # no GhostNote property on this note
 
     # Beat 1 was a rest (still advances the clock by one quarter note),
     # so the chord in beat 2 starts a full quarter note after beat 0.
@@ -136,3 +136,40 @@ def test_dump_ir_skips_bar_with_no_voice_for_this_track():
         notes="",
     )
     assert dump_ir(xml_text, track_index=1) == []
+
+
+def test_ghost_note_property_detected():
+    """A note with <Property name="GhostNote"><Enable/></Property> should
+    produce ghost_note=True; a note without it should produce ghost_note=False.
+    Property name inferred from GPIF's uniform Enable-flag pattern — unverified
+    against a real file with ghost notes, but the implementation is testable
+    with a synthetic fixture."""
+    master_bars, bars = _xml(track1_bar_id=1)
+    voices = '<Voice id="0"><Beats>0 1</Beats></Voice>'
+    beats = (
+        '<Beat id="0"><Rhythm ref="0" /><Notes>0</Notes></Beat>'
+        '<Beat id="1"><Rhythm ref="0" /><Notes>1</Notes></Beat>'
+    )
+    notes = """
+<Note id="0">
+<Properties>
+<Property name="Fret"><Fret>5</Fret></Property>
+<Property name="Midi"><Number>60</Number></Property>
+<Property name="String"><String>0</String></Property>
+<Property name="GhostNote"><Enable /></Property>
+</Properties>
+</Note>
+<Note id="1">
+<Properties>
+<Property name="Fret"><Fret>7</Fret></Property>
+<Property name="Midi"><Number>62</Number></Property>
+<Property name="String"><String>0</String></Property>
+</Properties>
+</Note>
+"""
+    xml_text = GPIF_TEMPLATE.format(
+        master_bars=master_bars, bars=bars, voices=voices, beats=beats, notes=notes
+    )
+    result = dump_ir(xml_text, track_index=1)
+    assert result[0]["ghost_note"] is True
+    assert result[1]["ghost_note"] is False

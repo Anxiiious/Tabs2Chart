@@ -6,9 +6,8 @@ preserving the tab's tempo so the chart is rhythm-synced to the real recording.
 **Full plan, current progress, and open decisions live in [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md).**
 That file is the project's source of truth — read it before diving deeper than this README.
 
-**Status:** produces playable charts — `shred2chart convert` writes a complete Clone Hero song
-folder, and the note-mapping/timing engine has been playtested end-to-end in Clone Hero and
-confirmed good (as of 2026-07-19). See "Where things stand" below.
+**Status:** produces playable (if rough) charts — `shred2chart convert` writes a complete Clone
+Hero song folder. See "Where things stand" below.
 
 This README assumes you've never used Python packaging, `pytest`, or GitHub before. Every command
 below is meant to be copy-pasted as-is.
@@ -52,11 +51,34 @@ Commands so far, run as `shred2chart <command>`:
 | `shred2chart dump-tempo song.gp` | Prints every tempo/time-signature change found in the file, as JSON. Works directly on `.gp`/`.gpx`, or on a `.gp3`/`.gp4`/`.gp5` via PyGuitarPro. |
 | `shred2chart list-tracks song.gp` | Lists each track's index and name — check this before `dump-ir`, since track 0 isn't reliably "the guitar" (see below). |
 | `shred2chart dump-ir song.gp --track N` | Prints every note on the given track — tick, pitch, string, fret, chord grouping, and technique flags (hammer-on/pull-off, slide in/out, palm mute, dead note, bend, tap, vibrato, tremolo picking, let ring, ties, accent, ghost note) — as JSON. |
-| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority; `--track N` to chart exactly one track verbatim (no blending — use this if auto-blend picks the wrong part for a section, see below); `--audio song.flac` to auto-convert and include `song.ogg` (ffmpeg-backed, see `shred2chart/media.py`); `--album-art cover.jpg` likewise for `album.png`; `--lead-in-bars N` (default 2) for calibration-friendly silence before the first note; `--offset-ms` for fine-tuning audio sync on top of that; `-o/--out` for a custom output folder. |
+| `shred2chart convert song.gp` | **The main event**: converts a `.gp` file into a Clone Hero song folder (`notes.chart` + `song.ini`), blending guitar tracks per section so leads and rhythm both get played. `--tracks 1,0` to control which tracks and their priority, `--offset-ms` for audio sync. |
+| `shred2chart moon-scraper manifest.json --command 'your-fork --stdin'` | Sends a generated machine-readable manifest to a custom Moon Scraper fork over stdin. |
 | `shred2chart verify-m0 song.gpx song.gp5` | For the older `.gpx` format only (see below): compares tempo read directly against tempo from a converted `.gp5`, and reports GO/NO-GO automatically. This is milestone **M0** from the game plan. |
 
 `convert` is the one that makes something playable; the rest are inspection tools that show you
 (and your coding agent) what's inside a file.
+
+For pipeline integration, `convert` can copy/convert audio and emit a versioned manifest:
+
+```bash
+shred2chart convert your_song.gp --audio recording.flac --json
+shred2chart moon-scraper songs/Artist\ -\ Title/moon-scraper-manifest.json \
+  --command 'path/to/moonscraper-fork --manifest-stdin'
+```
+
+The manifest (`moon-scraper-manifest.json`) is the hand-off contract. It contains the schema
+version, absolute chart/metadata/audio paths, source metadata, tempo and section events, chart
+event count, and offset. The fork should read JSON from stdin and return exit code 0; its stdout
+and stderr are captured by the adapter. Non-OGG audio is converted to `song.ogg` with `ffmpeg`.
+Without `--audio`, the existing manual Clone Hero/Moon Scraper workflow is unchanged.
+
+For a guided first conversion, add `--interactive`. It shows the detected tracks, lets you adjust
+the tracks and output folder, warns before writing into a non-empty folder, and reminds you that
+the generated folder expects an audio file named `song.ogg`:
+
+```bash
+shred2chart convert your_song.gp --interactive
+```
 
 ## 4. Your next concrete step
 
@@ -117,32 +139,14 @@ says every session must record it in the "Current State" section before moving o
   `.gp3`/`.gp4`/`.gp5` files (`dump-ir`), and every technique flag has shown up with a plausible
   count against a real file. This is milestone M1, and it's not fully checked off yet — it still
   needs a human to spot-check the output against the tab open in actual Guitar Pro (see §4 above).
-- `shred2chart convert` writes a complete Clone Hero song folder, including audio (`--audio`,
-  ffmpeg-backed) and album art (`--album-art`). Sections blend lead/rhythm tracks (or chart one
-  track verbatim with `--track N`), chugs come out as open notes, hammer-ons/taps/ties carry over.
-- **Timing fix (2026-07-19, playtest-confirmed):** charts stay in sync with the audio through
-  repeat barlines, 1st/2nd endings, and D.S. al Coda/Segno-Coda navigation — the converter
-  simulates real Guitar Pro *performance* order (`gpif_tempo.compute_playback_order`), not just
-  written order. A `--lead-in-bars` flag (default 2) adds silence before the first note so Clone
-  Hero's audio calibration has something to judge against.
-- **Note mapping (2026-07-19, playtest-confirmed):** the "smart contour" mapping (`mapper.py`)
-  went through ten real-bug iterations (M4 v1-v10), each driven by an actual in-game playtest
-  round, not speculative tuning — hand-position grouping, rank-ordered lane spread, exact-repeat
-  memoization (scoped correctly per hand-position group, not globally), and fret-aware grouping so
-  a low pedal tone on one string doesn't fragment a lead phrase into isolated notes. A full song
-  has been played start to finish in Clone Hero and confirmed to look and feel right, with one
-  known, deliberately-deferred gap: chords always voice as physically-adjacent lanes for now (see
-  Open Questions in the game plan for the follow-up ask — non-adjacent lanes for playability, not
-  fretting realism).
-- **Audio offset sign (2026-07-19, fixed):** `Offset`/`delay` are correctly negative now (audio
-  plays *later* than the chart's shifted tick 0) — previously positive, which required manually
-  re-correcting the offset in Moonscraper on every single export.
-- **Next up: an app container** so converting a song doesn't require the terminal — drop a `.gp`
-  and an audio file in, get a finished song folder out. Not started; see
-  `SHRED2CHART_GAMEPLAN.md` §11 for the open design questions.
+- `shred2chart convert` now writes a complete Clone Hero song folder. The note mapping is still
+  the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
+  next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
+  notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
+  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moon Scraper.**
 
-See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones), §8 (Current State), and
-§11 (App Container plan) for the detailed, up-to-date picture.
+See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
+the detailed, up-to-date picture.
 
 ## 6. Project layout
 
@@ -154,9 +158,8 @@ shred2chart/          the actual tool (Python package)
   tempo.py              reads tempo data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   ir_gp.py               reads per-note data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   blend.py              blends lead + rhythm tracks per section into one playable line
-  mapper.py             maps notes onto the 5 Clone Hero lanes (playtest-confirmed contour mapping)
+  mapper.py             maps notes onto the 5 Clone Hero lanes (naive version)
   chart_writer.py       writes notes.chart + song.ini
-  media.py              ffmpeg-backed audio/album-art conversion (--audio/--album-art)
   cli.py                the `shred2chart` command
 tests/                 automated tests (run with `pytest`)
 test_data/             put your real .gpx/.gp5 files here (git-ignored)

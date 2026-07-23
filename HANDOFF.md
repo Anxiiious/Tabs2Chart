@@ -35,10 +35,8 @@ All commands start with `shred2chart`. Here's what each does:
 This is what makes the charts. Run it like:
 
 ```bash
-shred2chart convert your_song.gp --audio your_song.flac
+shred2chart convert your_song.gp
 ```
-
-(`--audio` is optional — omit it and just drop `song.ogg` in yourself later, see below.)
 
 It creates a folder `songs/Artist - Title/` with two files:
 - `notes.chart` — the actual chart (lanes, notes, tempo, sections)
@@ -46,49 +44,10 @@ It creates a folder `songs/Artist - Title/` with two files:
 
 **Optional flags:**
 - `--out /path/to/folder` — put the output somewhere else (default is `songs/` folder)
-- `--audio your_song.flac` — auto-converts and drops in `song.ogg` (needs ffmpeg on PATH, or the bundled `ffmpeg/` folder in this repo)
-- `--lead-in-bars 2` — bars of silence before the first note (default **2**), so the highway scrolls before play starts and Clone Hero's audio calibration has something to judge against. Set to `0` to disable.
-- `--offset-ms 250` — *extra* fine-tune offset on top of the lead-in, for after you calibrate in Moonscraper/Clone Hero (default 0)
+- `--offset-ms 250` — delay the chart by that many milliseconds (for audio sync)
 - `--tracks 1,0` — pick specific tracks and their order (default: auto-picks guitar tracks)
 
-## Important: the chart now tracks repeats and D.S. al Coda navigation
-
-Real tabs don't play top-to-bottom in the order they're written — repeat barlines replay
-sections, 1st/2nd endings are conditional, and some songs jump around with D.S. al Coda
-(Segno/Coda) markers. **If you playtest a song and the guitar is out of sync — especially
-if the drift gets *worse* the longer the song plays** — that's this exact issue. It should
-already be fixed for `.gp` (GP7 zip) files: `shred2chart` now simulates the real play order
-before charting anything, instead of walking the tab in written order. Sanity check to
-avoid re-diagnosing something already fixed: `git log --oneline` should show commits
-mentioning "repeat" and "D.S. al Coda" — if a new song you convert still drifts, tell your
-coding agent, this might be a case (nested Codas, D.C./Fine markers) the fix doesn't cover
-yet (see `SHRED2CHART_GAMEPLAN.md` §10, Open Questions).
-
-## Status as of 2026-07-19: charts are good
-
-A full song (`Still Searching` by Senses Fail) has been playtested end-to-end in Clone Hero across
-several rounds of real feedback, and the user confirmed it "looks great now." Ten real mapping bugs
-(M4 v1-v10) and one audio-sync sign bug got found and fixed this way — see
-`SHRED2CHART_GAMEPLAN.md` §8 (Current State) for the full blow-by-blow if you need the history, but
-you don't need to re-derive any of it to keep using the tool. Two things worth knowing before you
-convert your next song:
-
-- **Auto-blending across multiple guitar tracks can pick a rhythm part over a lead part** for a
-  whole named section, if that section repeats and only part of the repeat has the interesting
-  part. If a chart sounds like it's missing an obvious lead line, try `--track N` (chart one track
-  verbatim — see `list-tracks` for the index) instead of the default auto-blend.
-- **One known, deliberate gap, not a bug:** chords currently always voice as physically-adjacent
-  lanes (e.g. a power chord's two notes sit next to each other on the highway), matching how the
-  chord is actually fretted. The user wants a follow-up that can spread some chords across
-  non-adjacent lanes purely for strumming variety, the way some professionally-charted songs do —
-  this hasn't been designed yet (see `SHRED2CHART_GAMEPLAN.md` Open Questions, 2026-07-19 entry).
-
 ## After You Convert a Song
-
-**If you passed `--audio your_song.flac` to `convert`**, `song.ogg` is already in the
-folder — skip to step 4.
-
-**Otherwise:**
 
 1. Take the generated folder (e.g., `songs/Senses Fail - Still Searching/`)
 2. Convert your audio file from FLAC to OGG:
@@ -102,9 +61,10 @@ folder — skip to step 4.
 ## How It Works (High Level)
 
 1. **Extract**: Reads `.gp` file directly (no Guitar Pro needed), pulls out every note with all the techniques (hammer-ons, slides, palm mutes, bends, taps, etc.)
-2. **Blend**: If the file has multiple guitar tracks, picks the most interesting part for each section of the song (blends lead into rhythm smoothly)
-3. **Map**: Converts notes to Clone Hero's 5-lane system (green/red/yellow/blue/orange), handles special cases like open chugs and tied notes
-4. **Emit**: Writes the `.chart` file with proper tempo, time signatures, and note events
+2. **Order**: Simulates Guitar Pro's actual playback order — repeat barlines, 1st/2nd endings, and D.S. al Coda (Segno/Coda) navigation — so bars that are played more than once (or skipped, or jumped to) land at the ticks they're actually heard at, not just their written-order position
+3. **Blend**: If the file has multiple guitar tracks, picks the most interesting part for each section of the song (blends lead into rhythm smoothly)
+4. **Map**: Converts notes to Clone Hero's 5-lane system (green/red/yellow/blue/orange), handles special cases like open chugs and tied notes
+5. **Emit**: Writes the `.chart` file with proper tempo, time signatures, and note events
 
 ## Key Files
 
@@ -113,7 +73,7 @@ folder — skip to step 4.
 - `shred2chart/mapper.py` — maps notes to lanes
 - `shred2chart/chart_writer.py` — writes `.chart` and `.ini` files
 - `shred2chart/ir_gpif.py` — reads note data from GP files
-- `shred2chart/gpif_tempo.py` — reads tempo/time-sig from GP files
+- `shred2chart/gpif_tempo.py` — reads tempo/time-sig from GP files, and simulates playback order (repeats, endings, D.S. al Coda) via `compute_playback_order`/`compute_bar_grid`
 - `tests/` — all the unit tests (run with `pytest`)
 
 ## What If Something Breaks?
@@ -126,25 +86,42 @@ folder — skip to step 4.
 
 1. Pick a song from your Sheet Happens album
 2. Run `shred2chart list-tracks song.gp` to see what's in it
-3. Run `shred2chart convert song.gp --audio song.flac` to make a chart with audio included
-   (add `--track N` instead of the default auto-blend if a chart seems to be missing an obvious
-   lead line — see "Status as of 2026-07-19" above)
-4. Test in Clone Hero or Moonscraper
-5. If it still doesn't sync right after the built-in lead-in, use `--offset-ms` to fine-tune
+3. Run `shred2chart convert song.gp` to make a chart
+4. Convert the audio to OGG and drop it in the folder
+5. Test in Clone Hero or Moonscraper
+6. If it doesn't sync right, use `--offset-ms` to adjust
 
-**What's actually next for this project (as of 2026-07-19), in priority order:**
+## User-Friendly Improvements Checklist
 
-1. **Convert the rest of your library** with the tool as it stands — the mapping/timing engine
-   is playtested and confirmed good; more songs mostly means more data on whether the same
-   bug classes recur on different material, not more engine work.
-2. **App container (M6, not started)** — you asked for a drop-a-file-in program instead of the
-   CLI. `SHRED2CHART_GAMEPLAN.md` §11 has the concrete design questions (target OS/packaging,
-   drag-and-drop vs. a small GUI window, ffmpeg bundling) that need answering before a coding
-   agent should start building — it's a real design conversation, not just "go build it," so
-   walk through §11 with your agent first.
-3. **Non-adjacent chord-lane spreading for playability** (see Open Questions) — a real, wanted
-   feature, not yet designed. Lower priority than the app container unless you hit it again while
-   converting more songs and it bothers you enough to want it sooner.
+- [x] Add an opt-in guided conversion workflow (`convert --interactive`)
+- [x] Validate input files and report filesystem errors clearly
+- [x] Protect existing output folders from accidental overwrites in guided mode
+- [x] Make track selection consistent across inspection and conversion commands
+- [x] Support conversion for all formats currently accepted by inspection commands
+- [x] Add a `check`/`validate` command for generated charts
+- [x] Add `--version`, verbosity controls, dry-run mode, and shell completion
+- [x] Improve audio handling and provide clearer `ffmpeg` guidance
+- [x] Add richer metadata and optional ready-to-import archives
+- [x] Escape metadata safely and validate generated chart files
+- [x] Add command-level integration tests and a sample fixture
+
+New CLI flags added in this round:
+
+| Flag | Command | What it does |
+|------|---------|-------------|
+| `--version` | `shred2chart` | Print the installed version |
+| `-v` / `--verbose` | `shred2chart` | Enable debug-level logging |
+| `-q` / `--quiet` | `shred2chart` | Suppress all progress output |
+| `--dry-run` | `convert` | Show what would happen without writing |
+| `--charter NAME` | `convert` | Set your name in song.ini and notes.chart |
+| `--archive` | `convert` | Create a ready-to-import `.zip` alongside the folder |
+
+New subcommand:
+
+```bash
+shred2chart check ./songs/Artist\ -\ Title/
+# prints OK or a list of validation errors
+```
 
 ## Questions?
 

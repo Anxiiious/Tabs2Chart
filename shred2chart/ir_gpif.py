@@ -55,9 +55,13 @@ Confidence notes (see SHRED2CHART_GAMEPLAN.md for the fuller picture):
 - ghost_note: PyGuitarPro's side of this exposes a real `ghostNote` flag
   (confirmed in its gp3.py/gp5.py source), but neither real GPIF file
   we've seen contains anything named "Ghost" — this song's tab may
-  simply not use the technique, or GP7 calls it something else. Exposed
-  here as an always-`False` stub rather than guessed, so the two
-  extractors' output shapes match; fix once a real example turns up.
+  simply not use the technique, or GP7 calls it something else.  Based
+  on GPIF's uniform `<Property name="X"><Enable/></Property>` pattern
+  for all boolean note flags, the most likely property name is
+  `"GhostNote"` (matching PyGuitarPro's own field name).  Implemented
+  as `"GhostNote" in props`; unverified against a real GPIF file that
+  actually carries a ghost note — fix the name here if it turns out to
+  be something else once such a file is seen.
 
 Note for Stage 4 (not handled here — M1's job is a faithful raw dump):
 per editor-on-fire's own importer, a tied note shouldn't be treated as a
@@ -148,7 +152,7 @@ def _note_to_ir(
         "tied": note_el.find("Tie") is not None,
         "tremolo_picked": tremolo_picked,
         "accent": note_el.find("Accent") is not None,
-        "ghost_note": False,  # no confirmed GPIF property for this yet — see module docstring
+        "ghost_note": "GhostNote" in props,  # property name inferred from GPIF pattern; unverified against a real ghost-note file
     }
 
 

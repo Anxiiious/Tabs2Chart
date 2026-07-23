@@ -9,10 +9,15 @@ dependencies = [
 
 [project.scripts]
 shred2chart = "shred2chart.cli:main"
+shred2chart-gui = "shred2chart.gui:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "argcomplete>=3.0",
+]
+gui = [
+    "tkinterdnd2>=0.4",
 ]
 
 [build-system]
