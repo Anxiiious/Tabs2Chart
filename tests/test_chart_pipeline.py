@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 from shred2chart.blend import blend_tracks
-from shred2chart.chart_writer import build_chart
-from shred2chart.mapper import CHART_RESOLUTION, map_notes
+from shred2chart.chart_writer import DEFAULT_LEAD_IN_BARS, add_lead_in, build_chart
+from shred2chart.mapper import (
+    CHART_RESOLUTION,
+    IR_TICKS_PER_QUARTER,
+    ChartNote,
+    map_notes,
+)
 
 IR_QUARTER = 960  # IR ticks per quarter note
 
@@ -18,6 +23,71 @@ def _note(tick, pitch=40, string=1, fret=0, duration=IR_QUARTER // 4, **flags):
     }
     base.update(flags)
     return base
+
+
+class TestLeadIn:
+    def test_default_is_two_bars(self):
+        assert DEFAULT_LEAD_IN_BARS == 2
+
+    def test_zero_bars_is_no_op(self):
+        tempo = [{"tick": 0, "type": "tempo", "bpm": 120}]
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        notes = [ChartNote(tick=0, lanes=[0])]
+
+        assert add_lead_in(tempo, sections, notes, bars=0) == (
+            tempo,
+            sections,
+            notes,
+            0,
+        )
+
+    def test_two_empty_bars_shift_score_and_keep_preroll_grid_at_zero(self):
+        tempo = [
+            {"tick": 0, "type": "time_signature", "numerator": 4, "denominator": 4},
+            {"tick": 0, "type": "tempo", "bpm": 120},
+            {"tick": 2 * 4 * IR_QUARTER, "type": "tempo", "bpm": 140},
+        ]
+        sections = [{"tick": 0, "bar": 0, "name": "Intro"}]
+        notes = [ChartNote(tick=0, lanes=[0], sustain=96, source={"original": True})]
+
+        shifted_tempo, shifted_sections, shifted_notes, lead_in_ms = add_lead_in(
+            tempo,
+            sections,
+            notes,
+        )
+
+        ir_shift = 2 * 4 * IR_TICKS_PER_QUARTER
+        chart_shift = 2 * 4 * CHART_RESOLUTION
+        assert any(event["type"] == "tempo" and event["tick"] == 0 for event in shifted_tempo)
+        assert any(
+            event["type"] == "time_signature" and event["tick"] == 0
+            for event in shifted_tempo
+        )
+        assert any(
+            event["type"] == "tempo"
+            and event["bpm"] == 120
+            and event["tick"] == ir_shift
+            for event in shifted_tempo
+        )
+        assert shifted_sections == [{"tick": ir_shift, "bar": 0, "name": "Intro"}]
+        assert shifted_notes[0].tick == chart_shift
+        assert shifted_notes[0].sustain == 96
+        assert shifted_notes[0].source == {"original": True}
+        assert lead_in_ms == 4000
+
+    def test_measure_length_uses_starting_time_signature(self):
+        tempo = [
+            {"tick": 0, "type": "time_signature", "numerator": 3, "denominator": 4},
+            {"tick": 0, "type": "tempo", "bpm": 120},
+        ]
+        _, _, notes, lead_in_ms = add_lead_in(
+            tempo,
+            [],
+            [ChartNote(tick=0, lanes=[0])],
+        )
+
+        assert notes[0].tick == 2 * 3 * CHART_RESOLUTION
+        assert lead_in_ms == 3000
 
 
 class TestBlend:
@@ -79,10 +149,10 @@ class TestMapper:
         assert len(notes) == 1
         assert notes[0].sustain == 2 * CHART_RESOLUTION  # two quarters, no trim needed
 
-    def test_chord_all_notes_kept_on_distinct_lanes(self):
-        # Chord interval-spread voicing was removed: every same-tick note
-        # gets its own lane via the distinct-lane guarantee (no capping,
-        # no interval-based spreading).
+    def test_chord_caps_at_three_distinct_lanes(self):
+        # Game plan rule 3: chords cap at 3 distinct notes for playability.
+        # A 4-note voicing collapses to 3 lanes rather than emitting a
+        # 4-note chord.
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
             _note(0, pitch=47, string=2, fret=5, chord_id=0),
@@ -92,8 +162,7 @@ class TestMapper:
         notes = map_notes(chord)
         assert len(notes) == 1
         lanes = notes[0].lanes
-        assert len(lanes) == 4  # no note loss, no 3-lane cap
-        assert len(set(lanes)) == 4  # all distinct
+        assert len(lanes) == 3  # capped, no 4-note chord
         assert all(0 <= lane <= 4 for lane in lanes)
 
     def test_power_chord_two_distinct_lanes(self):

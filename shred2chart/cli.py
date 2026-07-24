@@ -36,7 +36,7 @@ except Exception:
 
 from . import (
     blend, chart_writer, gpif_tempo, gpx_reader, integration, ir_gp, ir_gpif,
-    mapper, tempo, validation,
+    mapper, media, tempo, validation,
 )
 
 _CONTAINER_SUFFIXES = {".gp", ".gpx"}
@@ -202,8 +202,7 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
 
 def _safe_path_part(value: str) -> str:
     """Keep metadata-derived output paths within the songs directory."""
-    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "_", value)
-    cleaned = cleaned.replace("/", "_").replace("\\", "_").replace(":", "_").strip(" .")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]', "_", value).strip(" .")
     return cleaned or "Untitled"
 
 
@@ -368,7 +367,7 @@ def convert_song(
     album_art: str | Path | None = None,
     track: int | None = None,
     tracks: str | None = None,
-    lead_in_bars: int = 2,
+    lead_in_bars: int = chart_writer.DEFAULT_LEAD_IN_BARS,
     offset_ms: int = 0,
     charter: str = "",
     archive: bool = False,
@@ -449,12 +448,13 @@ def convert_song(
             raise ConvertError(f"error reading tempo from {path}: {e}") from e
         sections = []
 
+    if is_container and xml_text is not None:
+        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+    else:
+        bar_starts = _estimate_bar_starts(tempo_events)
+
     blend_spans = sections
     if not blend_spans and len(track_ids) > 1:
-        if is_container and xml_text is not None:
-            bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
-        else:
-            bar_starts = _estimate_bar_starts(tempo_events)
         blend_spans = [
             {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
             for i in range(0, len(bar_starts), 8)
@@ -471,7 +471,7 @@ def convert_song(
     except Exception as e:
         raise ConvertError(f"error parsing notes from {path}: {e}") from e
 
-    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans, bar_starts)
     section_ticks = [s["tick"] for s in sections]
     chart_notes = mapper.map_notes(blended, section_ticks=section_ticks)
 
@@ -479,11 +479,21 @@ def convert_song(
     for choice in choices:
         _info(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
+    tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
+        tempo_events,
+        sections,
+        chart_notes,
+        bars=lead_in_bars,
+    )
+    effective_offset_ms = offset_ms - lead_in_ms
+    if lead_in_ms:
+        _info(f"added {lead_in_bars} empty lead-in bars before the chart")
+
     out_dir = Path(out) if out else _default_output_dir(artist, title)
 
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes,
-        offset_ms=offset_ms, charter=resolved_charter,
+        offset_ms=effective_offset_ms, charter=resolved_charter,
     )
 
     audio_source = None
@@ -498,7 +508,11 @@ def convert_song(
         art_source = Path(album_art).expanduser()
         if not art_source.is_file():
             raise ConvertError(f"album art file does not exist: {art_source}")
-        shutil.copy2(art_source, out_dir / f"album{art_source.suffix.lower()}")
+        if media.place_album_art(art_source, out_dir) is None:
+            raise ConvertError(
+                f"could not create album.png from {art_source}; "
+                "install ffmpeg or choose a PNG image"
+            )
 
     errors = validation.validate_song_folder(
         out_dir, title, artist, tempo_events, audio_required=bool(audio)
@@ -508,7 +522,7 @@ def convert_song(
 
     manifest = integration.write_manifest(
         out_dir, title, artist, tempo_events, sections, len(chart_notes),
-        offset_ms=offset_ms, audio_path=audio_source,
+        offset_ms=effective_offset_ms, audio_path=audio_source,
     )
 
     if archive:
@@ -613,15 +627,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             return 1
         sections = []
 
+    if is_container and xml_text is not None:
+        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+    else:
+        # Estimate bar grid from tempo events for legacy files
+        bar_starts = _estimate_bar_starts(tempo_events)
+
     # Blend at section granularity; fall back to 8-bar windows for files
     # with no section markers.
     blend_spans = sections
     if not blend_spans and len(track_ids) > 1:
-        if is_container and xml_text is not None:
-            bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
-        else:
-            # Estimate bar grid from tempo events for legacy files
-            bar_starts = _estimate_bar_starts(tempo_events)
         blend_spans = [
             {"tick": bar_starts[i], "bar": i, "name": f"bars {i + 1}-{min(i + 8, len(bar_starts))}"}
             for i in range(0, len(bar_starts), 8)
@@ -641,7 +656,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         print(f"error parsing notes from {path}: {e}", file=sys.stderr)
         return 1
 
-    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans)
+    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans, bar_starts)
     section_ticks = [s["tick"] for s in sections]
     chart_notes = mapper.map_notes(blended, section_ticks=section_ticks)
 
@@ -652,6 +667,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     if not quiet and not args.json:
         for choice in choices:
             print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
+
+    tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
+        tempo_events,
+        sections,
+        chart_notes,
+        bars=args.lead_in_bars,
+    )
+    effective_offset_ms = args.offset_ms - lead_in_ms
+    if lead_in_ms:
+        _info(f"added {args.lead_in_bars} empty lead-in bars before the chart")
 
     if args.dry_run:
         if interactive_out is not None:
@@ -673,7 +698,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes,
-        offset_ms=args.offset_ms, charter=charter,
+        offset_ms=effective_offset_ms, charter=charter,
     )
     audio_source = None
     if args.audio:
@@ -695,7 +720,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     manifest = integration.write_manifest(
         out_dir, title, artist, tempo_events, sections, len(chart_notes),
-        offset_ms=args.offset_ms, audio_path=audio_source,
+        offset_ms=effective_offset_ms, audio_path=audio_source,
     )
 
     if getattr(args, "archive", False):
@@ -938,7 +963,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
-        help="audio offset in milliseconds (calibrate in Moon Scraper later; default 0)",
+        help="fine audio offset in milliseconds, applied after the lead-in (default 0)",
+    )
+    p_convert.add_argument(
+        "--lead-in-bars",
+        type=int,
+        default=chart_writer.DEFAULT_LEAD_IN_BARS,
+        help="empty measures before the score starts "
+        f"(default {chart_writer.DEFAULT_LEAD_IN_BARS}; 0 disables)",
     )
     p_convert.add_argument(
         "-i", "--interactive", action="store_true",

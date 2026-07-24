@@ -67,6 +67,7 @@ MIN_SUSTAIN = CHART_RESOLUTION // 2  # eighth note = 96
 SUSTAIN_GAP = CHART_RESOLUTION // 8  # 1/32 note = 24
 
 OPEN_NOTE = 7
+_MAX_CHORD_PITCHES = 3  # game plan rule 3: chords cap at 3 distinct notes for playability
 FORCED_FLAG = 5
 TAP_FLAG = 6
 
@@ -372,14 +373,44 @@ def _assign_group_lanes(
     lanes: dict[int, int] = {}
     taken: set[int] = set()
 
-    fretted = []
-    for note in group:
-        if note["fret"] == 0 and note["string"] == chug_string:
-            lanes[id(note)] = OPEN_NOTE
-        else:
-            fretted.append(note)
+    # An open chug is only unambiguous when it's the sole note struck at
+    # this tick - if it's one voice within a same-tick group, it's part of
+    # a chord voicing (e.g. an open string ringing under a fretted note),
+    # not an isolated rhythmic chug, and must go through the normal
+    # fretted-note lane logic like its groupmates.
+    if (
+        len(group) == 1
+        and group[0]["fret"] == 0
+        and group[0]["string"] == chug_string
+    ):
+        lanes[id(group[0])] = OPEN_NOTE
+        return lanes
 
+    fretted = list(group)
     fretted.sort(key=lambda n: n["pitch"] or 0)
+
+    # Collapse same-tick notes sharing a distinct pitch (octave/string
+    # doubles) down to one representative, then cap at 3 distinct pitches
+    # (game plan rule 3) - anything beyond that shares the lane of the
+    # nearest kept pitch rather than inflating the chord shape.
+    seen_pitches: dict[int, dict[str, Any]] = {}
+    extras: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for note in fretted:
+        pitch = note["pitch"] or 0
+        if pitch in seen_pitches:
+            extras.append((note, seen_pitches[pitch]))
+        else:
+            seen_pitches[pitch] = note
+
+    kept = list(seen_pitches.values())
+    kept.sort(key=lambda n: n["pitch"] or 0)
+    if len(kept) > _MAX_CHORD_PITCHES:
+        dropped = kept[_MAX_CHORD_PITCHES:]
+        kept = kept[:_MAX_CHORD_PITCHES]
+        for note in dropped:
+            extras.append((note, kept[-1]))
+
+    fretted = kept
 
     if not fretted:
         return lanes
@@ -389,6 +420,8 @@ def _assign_group_lanes(
         preferred = contour.raw_lane(note["pitch"] or 0, ir_tick)
         lane = _nearest_free_lane(preferred, taken)
         lanes[id(note)] = lane
+        for extra, representative in extras:
+            lanes[id(extra)] = lanes[id(representative)]
         # Keep the trend window continuous across mixed chord/single-note
         # runs, without touching _last_group_*/_recent_group_lanes (those
         # track chord-to-chord shape comparisons specifically).
@@ -469,6 +502,9 @@ def _assign_group_lanes(
     # The existing reset triggers (section marker, rest >= 1 bar) already
     # provide the periodic hard boundary a from-scratch design would add.
     contour._lane_cursor += chosen_anchor_lane - anchor_preferred_lane
+
+    for extra, representative in extras:
+        lanes[id(extra)] = lanes[id(representative)]
 
     contour._last_group_lanes = tuple(lanes[id(n)] for n in fretted)
     contour._last_group_pitches = current_pitches

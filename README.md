@@ -16,6 +16,34 @@ below is meant to be copy-pasted as-is.
 
 ## 1. One-time setup
 
+### Easiest option: Windows importer
+
+Run `dist/Tabs2Chart.exe`. Choose or drag in:
+
+1. the Guitar Pro tab (`.gp`, `.gpx`, `.gp3`, `.gp4`, or `.gp5`);
+2. the matching song audio (FLAC, MP3, WAV, OGG, and other common formats);
+3. your Clone Hero `Songs` folder.
+
+Tabs2Chart reads the artist/title from the tab and creates the finished
+`Artist - Song` folder in one click. If the tab, audio, and cover image have
+the same filename and live together, selecting the tab fills in the other
+files automatically. The output contains `notes.chart`, `song.ini`,
+`song.ogg`, optional `album.png`, and the integration manifest. Generated
+charts start with two empty measures before the first score event.
+After a successful import, the app automatically opens `notes.chart` in
+MoonScraper. It discovers a normal Windows installation automatically; the
+saved executable path and the auto-open checkbox are under **Advanced**.
+
+The repository also contains a reproducible custom MoonScraper patch under
+`tools/moonscraper-custom`. That build accepts the generated manifest and adds
+an audio-alignment overlay: MoonScraper's waveform is enabled automatically,
+the first playable note and detected audio attack are labeled, and the offset
+can be applied or nudged by 10/100 ms. The custom build requires Unity
+`2018.4.23f1`; an immediately runnable plugin-based copy is already available
+at `dist/Moonscraper-Tabs2Chart` and is preferred automatically.
+
+The Python setup below is only needed for development or command-line use.
+
 You need Python 3.10 or newer and `git`. Check what you have:
 
 ```bash

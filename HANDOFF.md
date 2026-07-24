@@ -21,6 +21,27 @@ A working tool that converts Guitar Pro tabs (`.gp` files) into playable Clone H
 
 ## What You Can Do Right Now
 
+### No-terminal Windows importer
+
+Open `dist/Tabs2Chart.exe`, then choose the Guitar Pro tab, matching song
+audio, and your Clone Hero `Songs` folder. The importer creates the complete
+`Artist - Song` folder. It supports `.gp`, `.gpx`, `.gp3`, `.gp4`, and `.gp5`,
+automatically detects same-named audio/cover files, and includes ffmpeg for
+audio conversion. Every generated chart includes two empty lead-in measures
+before the score starts.
+After import, Tabs2Chart finds MoonScraper and opens the generated
+`notes.chart` automatically. The Advanced panel lets you change the
+executable, disable automatic opening, or reopen the last chart manually.
+
+A custom MoonScraper source patch lives in `tools/moonscraper-custom`. It adds
+manifest-aware startup and an `F8` audio-alignment guide that enables the
+waveform, compares the first playable note with the first detected audio
+attack, shows their millisecond delta, and provides apply/±10/±100 ms controls.
+The patch and guide are prepared and syntax-validated, but a custom executable
+from the official source still requires Unity `2018.4.23f1`. A separate,
+non-destructive plugin-based custom copy is ready now at
+`dist/Moonscraper-Tabs2Chart`; Tabs2Chart prefers it automatically.
+
 All commands start with `shred2chart`. Here's what each does:
 
 | Command | What it does |
@@ -74,6 +95,8 @@ It creates a folder `songs/Artist - Title/` with two files:
 - `shred2chart/chart_writer.py` — writes `.chart` and `.ini` files
 - `shred2chart/ir_gpif.py` — reads note data from GP files
 - `shred2chart/gpif_tempo.py` — reads tempo/time-sig from GP files, and simulates playback order (repeats, endings, D.S. al Coda) via `compute_playback_order`/`compute_bar_grid`
+- `shred2chart/moonscraper.py` — discovers MoonScraper and opens generated charts
+- `tools/moonscraper-custom/` — pinned custom-fork patch and reproducible Unity build scripts
 - `tests/` — all the unit tests (run with `pytest`)
 
 ## What If Something Breaks?

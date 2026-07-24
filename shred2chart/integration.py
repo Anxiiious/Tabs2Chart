@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -9,6 +10,21 @@ from typing import Any
 
 
 MANIFEST_SCHEMA = "https://tabs2chart.dev/schemas/moon-scraper-manifest.v1.json"
+
+
+def _split_command(command: str) -> list[str]:
+    """Split a user-entered command without eating Windows path separators."""
+    if os.name != "nt":
+        return shlex.split(command)
+
+    lexer = shlex.shlex(command, posix=False)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    argv = list(lexer)
+    return [
+        arg[1:-1] if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in {'"', "'"} else arg
+        for arg in argv
+    ]
 
 
 def write_manifest(
@@ -59,7 +75,7 @@ def invoke_moon_scraper(
     manifest = Path(manifest_path).resolve()
     if not manifest.is_file():
         raise FileNotFoundError(f"manifest does not exist: {manifest}")
-    argv = shlex.split(command)
+    argv = _split_command(command)
     if not argv:
         raise ValueError("Moon Scraper command cannot be empty")
     completed = subprocess.run(

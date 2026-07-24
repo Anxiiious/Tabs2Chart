@@ -15,11 +15,78 @@ the game plan's "do not code note flags from memory" mandate:
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .mapper import FORCED_FLAG, TAP_FLAG, CHART_RESOLUTION, ChartNote, _to_chart_ticks
+from .mapper import (
+    FORCED_FLAG,
+    TAP_FLAG,
+    CHART_RESOLUTION,
+    IR_TICKS_PER_QUARTER,
+    ChartNote,
+    _to_chart_ticks,
+)
 from .validation import escape_metadata
+
+DEFAULT_LEAD_IN_BARS = 2
+
+
+def add_lead_in(
+    tempo_events: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    chart_notes: list[ChartNote],
+    bars: int = DEFAULT_LEAD_IN_BARS,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[ChartNote], int]:
+    """Insert whole empty measures before the score timeline.
+
+    Notes and sections move together. The original tempo map also moves, but
+    copies of the starting tempo and time signature remain at tick 0 so the
+    pre-roll itself uses the song's real measure length instead of Clone
+    Hero's implicit 120 BPM / 4/4 defaults.
+
+    GP events use 960 ticks/quarter while chart notes already use 192. The
+    returned lead-in duration is milliseconds at the starting tempo; callers
+    use it to delay unmodified audio by the same musical duration.
+    """
+    if bars <= 0:
+        return tempo_events, sections, chart_notes, 0
+
+    starting: dict[str, dict[str, Any]] = {}
+    for event in sorted(tempo_events, key=lambda event: event["tick"]):
+        if event["tick"] > 0:
+            break
+        if event["type"] in {"tempo", "time_signature"}:
+            starting[event["type"]] = event
+
+    time_signature = starting.get(
+        "time_signature",
+        {"numerator": 4, "denominator": 4},
+    )
+    numerator = time_signature["numerator"]
+    denominator = time_signature["denominator"]
+    bar_quarters = numerator * 4 / denominator
+
+    starting_tempo = starting.get("tempo", {"bpm": 120.0})
+    bpm = float(starting_tempo["bpm"])
+    ir_shift = round(bar_quarters * IR_TICKS_PER_QUARTER * bars)
+    chart_shift = round(bar_quarters * CHART_RESOLUTION * bars)
+    lead_in_ms = round(bar_quarters * bars * 60_000 / bpm)
+
+    seed_events = [{**event, "tick": 0} for event in starting.values()]
+    shifted_tempo = seed_events + [
+        {**event, "tick": event["tick"] + ir_shift}
+        for event in tempo_events
+    ]
+    shifted_sections = [
+        {**section, "tick": section["tick"] + ir_shift}
+        for section in sections
+    ]
+    shifted_notes = [
+        replace(note, tick=note.tick + chart_shift)
+        for note in chart_notes
+    ]
+    return shifted_tempo, shifted_sections, shifted_notes, lead_in_ms
 
 
 def _sync_track_lines(tempo_events: list[dict[str, Any]]) -> list[str]:
