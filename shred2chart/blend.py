@@ -20,6 +20,15 @@ rhythm wall behind it. Two tracks only alternate bar-by-bar when they're
 both similarly technique-heavy at once (a genuine twin-lead harmony,
 not one lead over one chug part) and bar boundaries are supplied.
 
+Palm-muted/dead (ghost) notes are the opposite signal: an explicit,
+reliable marker of rhythm-guitar articulation (the muted chugging
+attack), not melodic playing. A track can rack up a technique bonus
+from a couple of incidental hammer-ons or slides played *within* an
+otherwise heavily palm-muted pattern (common in metalcore chug riffs)
+without being a real lead line — so palm-mute/dead-note density is
+subtracted from the technique bonus before the lead-dominance check,
+preventing that false positive.
+
 The per-section choices are returned alongside the notes so the CLI can
 show exactly which track "won" each section (and the user can override
 by passing a single track instead).
@@ -34,19 +43,32 @@ TECHNIQUE_FLAGS = (
 )
 TECHNIQUE_WEIGHT = 2
 
-LEAD_DOMINANCE_RATIO = 1.5  # a track's technique weight must beat the runner-up's by this much to win outright as "the lead"
+RHYTHM_FLAGS = ("palm_mute", "dead_note")
+RHYTHM_WEIGHT = 2  # per-note penalty against lead_index, same magnitude as TECHNIQUE_WEIGHT's bonus
+
+LEAD_DOMINANCE_RATIO = 1.5  # a track's lead_index must beat the runner-up's by this much to win outright as "the lead"
 HARMONY_RATIO = 0.6  # second-best track's total score must reach this fraction of the winner's to alternate bar-by-bar
 
 
-def _score(notes: list[dict[str, Any]]) -> tuple[int, int]:
-    """(total_score, technique_weight) - technique_weight isolates the
-    "flashy solo" signal from raw note count, so a busy chug part can't
-    out-rank a sparse-but-technique-heavy lead on note count alone."""
+def _score(notes: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """(total_score, technique_weight, lead_index).
+
+    technique_weight isolates the "flashy solo" signal from raw note
+    count, so a busy chug part can't out-rank a sparse-but-technique-heavy
+    lead on note count alone. lead_index nets that bonus against a
+    palm-mute/dead-note penalty, so a track that's mostly muted rhythm
+    playing can't pass as "the lead" just for a few embellishments
+    played within the muted pattern - see module docstring.
+    """
     technique_weight = sum(
         TECHNIQUE_WEIGHT * sum(1 for flag in TECHNIQUE_FLAGS if note.get(flag))
         for note in notes
     )
-    return len(notes) + technique_weight, technique_weight
+    rhythm_weight = sum(
+        RHYTHM_WEIGHT * sum(1 for flag in RHYTHM_FLAGS if note.get(flag))
+        for note in notes
+    )
+    return len(notes) + technique_weight, technique_weight, technique_weight - rhythm_weight
 
 
 def _ranked_tracks(
@@ -54,16 +76,16 @@ def _ranked_tracks(
     priority: list[int],
     start: float,
     end: float,
-) -> list[tuple[int, int, int]]:
-    """[(track_id, score, technique_weight), ...] for this span, highest
-    score first, ties broken by `priority` order. Tracks scoring 0 are
-    omitted."""
+) -> list[tuple[int, int, int, int]]:
+    """[(track_id, score, technique_weight, lead_index), ...] for this
+    span, highest score first, ties broken by `priority` order. Tracks
+    scoring 0 are omitted."""
     scored = []
     for track_id in priority:
         in_span = [n for n in tracks_notes[track_id] if start <= n["tick"] < end]
-        span_score, technique_weight = _score(in_span)
+        span_score, technique_weight, lead_index = _score(in_span)
         if span_score > 0:
-            scored.append((track_id, span_score, technique_weight))
+            scored.append((track_id, span_score, technique_weight, lead_index))
     scored.sort(key=lambda item: (-item[1], priority.index(item[0])))
     return scored
 
@@ -105,15 +127,15 @@ def blend_tracks(
         if not ranked:
             continue  # no track has anything here
 
-        # A clear technique leader (the "squiddly doo" part) wins the
-        # whole span outright, even if a busier chug track has a higher
-        # raw note count - that's the whole point of tracking technique
-        # weight separately from total score.
-        technique_ranked = sorted(ranked, key=lambda item: (-item[2], priority.index(item[0])))
-        top_id, _, top_technique = technique_ranked[0]
-        runner_technique = technique_ranked[1][2] if len(technique_ranked) >= 2 else 0
-        lead_dominant = top_technique > 0 and (
-            runner_technique == 0 or top_technique >= runner_technique * LEAD_DOMINANCE_RATIO
+        # A clear lead leader (the "squiddly doo" part, net of any
+        # palm-mute/dead-note penalty) wins the whole span outright, even
+        # if a busier chug track has a higher raw note count - that's the
+        # whole point of tracking lead_index separately from total score.
+        lead_ranked = sorted(ranked, key=lambda item: (-item[3], priority.index(item[0])))
+        top_id, _, _, top_lead = lead_ranked[0]
+        runner_lead = lead_ranked[1][3] if len(lead_ranked) >= 2 else 0
+        lead_dominant = top_lead > 0 and (
+            runner_lead <= 0 or top_lead >= runner_lead * LEAD_DOMINANCE_RATIO
         )
 
         harmonized = (
@@ -127,7 +149,7 @@ def blend_tracks(
             # Single winner for the whole span - lead-dominant track, or
             # plain highest score when no track stands out technically.
             winner = top_id if lead_dominant else ranked[0][0]
-            alternates = [t for t, _, _ in ranked if t != winner][:1]
+            alternates = [t for t, _, _, _ in ranked if t != winner][:1]
             _emit_span(
                 blended, choices, tracks_notes, name, start, end, bar_starts,
                 lambda bar_index, w=winner: w, alternates,
@@ -138,7 +160,7 @@ def blend_tracks(
         # twin-guitar riff, not just a quiet doubling) - alternate
         # between them bar-by-bar so the chart reads both harmony parts
         # instead of only ever showing one.
-        alternates = [t for t, _, _ in ranked[:2]]
+        alternates = [t for t, _, _, _ in ranked[:2]]
         _emit_span(
             blended, choices, tracks_notes, name, start, end, bar_starts,
             lambda bar_index, alt=alternates: alt[bar_index % 2], alternates,
