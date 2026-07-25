@@ -1,6 +1,7 @@
 // Runtime plugin used by the no-Unity, BepInEx-based custom MoonScraper copy.
 using System;
 using BepInEx;
+using BepInEx.Logging;
 using UnityEngine;
 using MoonscraperEngine.Audio;
 using MoonscraperChartEditor.Song;
@@ -25,7 +26,13 @@ public class Tabs2ChartAlignmentPlugin : BaseUnityPlugin
 
 public class Tabs2ChartAlignmentGuide : MonoBehaviour
 {
-    ChartEditor editor;
+    // Not cached in Start(): BepInEx plugins can initialize before
+    // ChartEditor.Instance is assigned by the game's own scene bootstrap.
+    // A one-time capture would freeze this at null forever, silently
+    // no-opping every button through AdjustOffset's null guard with no
+    // error logged - re-reading the singleton live avoids that entirely.
+    ChartEditor editor { get { return ChartEditor.Instance; } }
+    static readonly ManualLogSource log = BepInEx.Logging.Logger.CreateLogSource("Tabs2Chart Alignment Guide");
     bool visible = true;
     bool waveformEnabled;
     bool analysisRequested;
@@ -33,11 +40,6 @@ public class Tabs2ChartAlignmentGuide : MonoBehaviour
     float transientSeconds;
     string analysisStatus = "Waiting for chart audio...";
     Rect windowRect = new Rect(340, 52, 360, 255);
-
-    void Start()
-    {
-        editor = ChartEditor.Instance;
-    }
 
     void Update()
     {
@@ -109,9 +111,15 @@ public class Tabs2ChartAlignmentGuide : MonoBehaviour
     void AdjustOffset(float seconds)
     {
         if (editor == null || editor.currentSong == null)
+        {
+            log.LogWarning("Button click ignored: " + (editor == null ? "ChartEditor.Instance is null" : "currentSong is null") + ".");
             return;
+        }
+        float before = editor.currentSong.offset;
         editor.currentSong.offset += seconds;
         ChartEditor.isDirty = true;
+        log.LogInfo("Offset adjusted by " + (seconds * 1000).ToString("0") + " ms: " +
+            (before * 1000).ToString("0") + " -> " + (editor.currentSong.offset * 1000).ToString("0") + " ms.");
     }
 
     void OnGUI()
