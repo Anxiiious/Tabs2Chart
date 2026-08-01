@@ -35,6 +35,16 @@ SECTOR_SIZE = 0x1000
 MAGIC_BCFS = b"BCFS"
 MAGIC_BCFZ = b"BCFZ"
 
+# Safety ceilings against malformed/hostile files: BCFZ declares its own
+# decompressed length up front, and nothing else bounds it, so a corrupt or
+# adversarial header could otherwise make us allocate an enormous buffer.
+# Bound it by both an input-relative ratio and an absolute cap.
+_MAX_BCFZ_RATIO = 1000
+_MAX_BCFZ_SIZE = 512 * 1024 * 1024  # 512 MiB
+
+# Same idea for a single extracted score.gpif inside a zip container.
+_MAX_GPIF_SIZE = 256 * 1024 * 1024  # 256 MiB
+
 
 class GpxFormatError(ValueError):
     """Raised when a .gpx file doesn't match the expected BCFS/BCFZ layout."""
@@ -84,6 +94,13 @@ def decompress_bcfz(payload: bytes) -> bytes:
     expected_len = struct.unpack_from("<i", payload, 0)[0]
     if expected_len < 0:
         raise GpxFormatError(f"BCFZ declares a negative decompressed length: {expected_len}")
+
+    max_allowed = min(_MAX_BCFZ_SIZE, len(payload) * _MAX_BCFZ_RATIO)
+    if expected_len > max_allowed:
+        raise GpxFormatError(
+            f"BCFZ declares an implausible decompressed length {expected_len} "
+            f"for a {len(payload)}-byte input (limit {max_allowed})"
+        )
 
     reader = _BitReader(payload[4:])
     out = bytearray()
@@ -145,6 +162,11 @@ def unpack_bcfs(payload: bytes) -> list[ContainedFile]:
             if block == 0:
                 break
             block_off = block * SECTOR_SIZE
+            if block < 0 or block_off + SECTOR_SIZE > len(payload):
+                raise GpxFormatError(
+                    f"{file_name!r} references out-of-range block index {block} "
+                    f"(payload has {n_sectors} sectors)"
+                )
             file_data.extend(payload[block_off:block_off + SECTOR_SIZE])
             block_count += 1
 
@@ -203,23 +225,48 @@ def read_gpx(path: str | Path) -> list[ContainedFile]:
         return read_gpx_bytes(f.read())
 
 
+def _decode_gpif(data: bytes) -> str:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise GpxFormatError(
+            "score.gpif isn't valid UTF-8 text — if this is a Guitar Pro 8 "
+            "file, its content may be encrypted; this tool doesn't support "
+            "that yet"
+        ) from e
+    if "<GPIF" not in text[:200]:
+        raise GpxFormatError(
+            "score.gpif doesn't look like GPIF XML (got unexpected content "
+            "where an XML header should be) — it may be encrypted or in an "
+            "unrecognized variant of the format"
+        )
+    return text
+
+
+def _extract_gpif_from_zip(data: bytes) -> str:
+    """Read just the *.gpif entry out of a zip container, without loading
+    every other contained file (audio/asset entries can be large and are
+    never needed for this)."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(".gpif"):
+                continue
+            if info.file_size > _MAX_GPIF_SIZE:
+                raise GpxFormatError(
+                    f"{info.filename!r} declares an uncompressed size of "
+                    f"{info.file_size} bytes, above the {_MAX_GPIF_SIZE}-byte "
+                    "safety limit for a score.gpif entry"
+                )
+            return _decode_gpif(zf.read(info))
+    raise GpxFormatError("no *.gpif file found inside this container")
+
+
 def extract_gpif(path: str | Path) -> str:
     """Extract and decode the score.gpif XML from a `.gp`/`.gpx` file."""
-    for contained in read_gpx(path):
+    data = Path(path).read_bytes()
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        return _extract_gpif_from_zip(data)
+    for contained in read_gpx_bytes(data):
         if contained.name.lower().endswith(".gpif"):
-            try:
-                text = contained.data.decode("utf-8")
-            except UnicodeDecodeError as e:
-                raise GpxFormatError(
-                    "score.gpif isn't valid UTF-8 text — if this is a Guitar Pro 8 "
-                    "file, its content may be encrypted; this tool doesn't support "
-                    "that yet"
-                ) from e
-            if "<GPIF" not in text[:200]:
-                raise GpxFormatError(
-                    "score.gpif doesn't look like GPIF XML (got unexpected content "
-                    "where an XML header should be) — it may be encrypted or in an "
-                    "unrecognized variant of the format"
-                )
-            return text
+            return _decode_gpif(contained.data)
     raise GpxFormatError("no *.gpif file found inside this container")
