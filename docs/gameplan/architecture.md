@@ -94,9 +94,10 @@ Output should be playable and *recognizable* without manual edits; Moonscraper i
 
 ## 7. Desktop Import Wrapper
 
-The Windows importer is a thin Tkinter/PyInstaller shell over
+The Windows importer is a thin PySide6/PyInstaller shell over
 `cli.convert_song`; it does not duplicate parsing, mapping, timing, or emit
-logic. The normal workflow is tab + audio + Clone Hero Songs directory, with
+logic. The prior Tk implementation is preserved as `gui_tk_legacy.py` but is
+not the shipped front end. The normal workflow is tab + audio + Clone Hero Songs directory, with
 metadata-derived `Artist - Title` output, automatic same-name audio/art
 detection, guarded replacement of an existing song folder, background
 conversion, progress reporting, and an open-output action. The standalone

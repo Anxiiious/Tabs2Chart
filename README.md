@@ -167,11 +167,12 @@ says every session must record it in the "Current State" section before moving o
   `.gp3`/`.gp4`/`.gp5` files (`dump-ir`), and every technique flag has shown up with a plausible
   count against a real file. This is milestone M1, and it's not fully checked off yet — it still
   needs a human to spot-check the output against the tab open in actual Guitar Pro (see §4 above).
-- `shred2chart convert` now writes a complete Clone Hero song folder. The note mapping is still
-  the simple placeholder version (lane choices will look jumpy — the smart "contour" mapping is the
-  next milestone), but charts load, sections blend lead/rhythm tracks, chugs come out as open
-  notes, and hammer-ons/taps carry over. **The single most useful thing you can do now: convert a
-  song, drop its audio in the folder as `song.ogg`, and try it in Clone Hero or Moon Scraper.**
+- `shred2chart convert` writes a complete Clone Hero song folder with contour-based lane mapping,
+  scored chord-shape heuristics, section blending, open-string chugs, hammer-ons/taps, and
+  repeat-aware playback order. Mapper quality is still being tuned against real tabs — human
+  playtests in Clone Hero or MoonScraper remain the milestone gate. **The single most useful
+  thing you can do now: convert a song, drop its audio in the folder as `song.ogg`, align timing
+  in the custom MoonScraper copy if needed, and play it in Clone Hero.**
 
 See [`SHRED2CHART_GAMEPLAN.md`](SHRED2CHART_GAMEPLAN.md) §7 (Milestones) and §8 (Current State) for
 the detailed, up-to-date picture.
@@ -186,7 +187,8 @@ shred2chart/          the actual tool (Python package)
   tempo.py              reads tempo data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   ir_gp.py               reads per-note data out of .gp3/.gp4/.gp5 files (via PyGuitarPro)
   blend.py              blends lead + rhythm tracks per section into one playable line
-  mapper.py             maps notes onto the 5 Clone Hero lanes (naive version)
+  mapper.py             maps notes onto the 5 Clone Hero lanes (contour + chord-shape heuristic)
+  gui.py                PySide6 importer window (Tk fallback: gui_tk_legacy.py)
   chart_writer.py       writes notes.chart + song.ini
   cli.py                the `shred2chart` command
 tests/                 automated tests (run with `pytest`)

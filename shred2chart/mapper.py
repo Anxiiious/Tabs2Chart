@@ -21,11 +21,11 @@ Mechanism:
   intervals = bigger steps, direction from sign of the interval).
 - The visible lane is `_lane_cursor % 5` — this is what gives the wrap.
 - Repeated identical pitch: interval is 0, cursor doesn't move, same lane.
-- Phrase boundary (section marker or rest >= 1 bar) resets the cursor
-  to 0 (green) — a fresh run always starts climbing from the bottom,
-  matching real-guitar fretting-hand ergonomics (anchor stays low,
-  higher notes are a temporary reach off that anchor) rather than
-  anchoring high for descending phrases.
+- Phrase starts (section marker or rest >= 1 bar): `_plan_phrase_start_lanes`
+  picks a starting lane before the phrase is emitted — full-section lookahead
+  at section boundaries; local lookahead at bar lines for compact descending
+  openings. Section chord-shape memory survives rests; exact-measure lane
+  replay handles returning identical source measures later in the tab.
 
 CHORDS: a same-tick group's lowest-pitched note (the "anchor") advances
 the shared cursor exactly like a single note above — this is what keeps
