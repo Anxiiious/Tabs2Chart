@@ -16,9 +16,11 @@ A track counts as "lead" for a span when its technique-flag density is
 meaningfully higher than the runner-up's (bends/slides/hammer-ons/taps/
 vibrato — the "squiddly doo" stuff) — that track wins the whole span
 outright, same as a human charter always following the solo over the
-rhythm wall behind it. Two tracks only alternate bar-by-bar when they're
-both similarly technique-heavy at once (a genuine twin-lead harmony,
-not one lead over one chug part) and bar boundaries are supplied.
+rhythm wall behind it. When two similarly active tracks form a genuine
+twin-guitar harmony, the blended line follows the upper voice whenever
+it enters; it does not alternate whole bars between parts. Notes copied
+from that upper voice carry a private ``harmony_voice`` marker so the
+mapper can give the resulting chord the extra lane spread it needs.
 
 Palm-muted/dead (ghost) notes are the opposite signal: an explicit,
 reliable marker of rhythm-guitar articulation (the muted chugging
@@ -47,7 +49,11 @@ RHYTHM_FLAGS = ("palm_mute", "dead_note")
 RHYTHM_WEIGHT = 2  # per-note penalty against lead_index, same magnitude as TECHNIQUE_WEIGHT's bonus
 
 LEAD_DOMINANCE_RATIO = 1.5  # a track's lead_index must beat the runner-up's by this much to win outright as "the lead"
-HARMONY_RATIO = 0.6  # second-best track's total score must reach this fraction of the winner's to alternate bar-by-bar
+HARMONY_RATIO = 0.6  # second-best track's total score must reach this fraction of the winner's for harmony handling
+# Two parts that share this many simultaneous onsets in one bar are a dense
+# harmonized chord passage, not a brief call-and-response.  Retain both in a
+# single playable chord representation (the mapper caps it at three lanes).
+DENSE_HARMONY_ONSETS = 8
 
 
 def _score(notes: list[dict[str, Any]]) -> tuple[int, int, int]:
@@ -95,6 +101,7 @@ def blend_tracks(
     priority: list[int],
     sections: list[dict[str, Any]],
     bar_starts: list[int] | None = None,
+    bar_track_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Merge several tracks' IR note lists into one, choosing one track
     per section span (or alternating bar-by-bar within a span when two
@@ -105,6 +112,9 @@ def blend_tracks(
     sections: from gpif_tempo.dump_sections (may be empty -> one span)
     bar_starts: from gpif_tempo.compute_bar_grid, needed to detect and
         subdivide harmonized spans; without it, sections are never split.
+    bar_track_overrides: {bar_start_tick: track_id} forced selections. An
+        override is strict: a selected silent track leaves that source bar
+        silent rather than quietly substituting a different guitar part.
 
     Returns (blended_notes, choices) where choices is
     [{"section", "start_tick", "track"}, ...] (one entry per section, or
@@ -152,18 +162,17 @@ def blend_tracks(
             alternates = [t for t, _, _, _ in ranked if t != winner][:1]
             _emit_span(
                 blended, choices, tracks_notes, name, start, end, bar_starts,
-                lambda bar_index, w=winner: w, alternates,
+                lambda bar_index, w=winner: w, alternates, bar_track_overrides,
             )
             continue
 
         # Two tracks are both genuinely active at once (a harmonized
-        # twin-guitar riff, not just a quiet doubling) - alternate
-        # between them bar-by-bar so the chart reads both harmony parts
-        # instead of only ever showing one.
-        alternates = [t for t, _, _, _ in ranked[:2]]
-        _emit_span(
+        # twin-guitar riff, not just a quiet doubling). Follow the upper
+        # register when it is present instead of arbitrarily swapping
+        # whole bars between the two parts.
+        _emit_harmony_span(
             blended, choices, tracks_notes, name, start, end, bar_starts,
-            lambda bar_index, alt=alternates: alt[bar_index % 2], alternates,
+            [t for t, _, _, _ in ranked[:2]], bar_track_overrides,
         )
 
     blended.sort(key=lambda n: n["tick"])
@@ -180,6 +189,7 @@ def _emit_span(
     bar_starts: list[int] | None,
     preferred_for_bar,
     fallback_order: list[int],
+    bar_track_overrides: dict[int, int] | None,
 ) -> None:
     """Emit one span's notes, bar by bar if `bar_starts` is available.
 
@@ -201,14 +211,105 @@ def _emit_span(
     bar_bounds = span_bars + [end]
     for bar_index, bar_start in enumerate(span_bars):
         bar_end = bar_bounds[bar_index + 1]
-        preferred = preferred_for_bar(bar_index)
-        candidates = [preferred] + [t for t in fallback_order if t != preferred]
+        override = (bar_track_overrides or {}).get(bar_start)
+        preferred = override if override is not None else preferred_for_bar(bar_index)
+        candidates = [preferred] if override is not None else [
+            preferred, *[t for t in fallback_order if t != preferred],
+        ]
         for track_id in candidates:
             bar_notes = [n for n in tracks_notes[track_id] if bar_start <= n["tick"] < bar_end]
             if bar_notes:
                 break
         else:
             continue  # no candidate has anything in this bar
+        blended.extend(bar_notes)
+        label = f"{name} (bar {bar_index + 1})" if len(span_bars) > 1 else name
+        choices.append({"section": label, "start_tick": bar_start, "track": track_id})
+
+
+def _median_pitch(notes: list[dict[str, Any]]) -> float:
+    """A stable register representative for one track within one bar."""
+    pitches = sorted(note["pitch"] for note in notes if note.get("pitch") is not None)
+    if not pitches:
+        return float("-inf")
+    midpoint = len(pitches) // 2
+    if len(pitches) % 2:
+        return pitches[midpoint]
+    return (pitches[midpoint - 1] + pitches[midpoint]) / 2
+
+
+def _is_dense_simultaneous_harmony(active: dict[int, list[dict[str, Any]]]) -> bool:
+    """Whether the active parts form a sustained, simultaneous chord wall."""
+    if len(active) < 2:
+        return False
+    onset_sets = [set(note["tick"] for note in notes) for notes in active.values()]
+    shared = set.intersection(*onset_sets)
+    return len(shared) >= DENSE_HARMONY_ONSETS
+
+
+def _emit_harmony_span(
+    blended: list[dict[str, Any]],
+    choices: list[dict[str, Any]],
+    tracks_notes: dict[int, list[dict[str, Any]]],
+    name: str,
+    start: float,
+    end: float,
+    bar_starts: list[int] | None,
+    candidates: list[int],
+    bar_track_overrides: dict[int, int] | None,
+) -> None:
+    """Emit a twin-guitar span without arbitrary bar-by-bar alternation.
+
+    The higher-register active part wins each bar.  Mark it when it is not
+    the priority track, preserving the musical reason the mapper should
+    widen its two-note chord shape (for example, G/R -> R/B rather than an
+    unrelated G/R -> R/Y jump).
+    """
+    if not bar_starts:
+        bar_starts = [start]
+    span_bars = [bar for bar in bar_starts if start <= bar < end] or [start]
+    bar_bounds = span_bars + [end]
+    priority_order = {track_id: index for index, track_id in enumerate(candidates)}
+
+    for bar_index, bar_start in enumerate(span_bars):
+        bar_end = bar_bounds[bar_index + 1]
+        override = (bar_track_overrides or {}).get(bar_start)
+        if override is not None:
+            bar_notes = [
+                note for note in tracks_notes[override]
+                if bar_start <= note["tick"] < bar_end
+            ]
+            if bar_notes:
+                blended.extend(bar_notes)
+            label = f"{name} (bar {bar_index + 1})" if len(span_bars) > 1 else name
+            choices.append({"section": label, "start_tick": bar_start, "track": override})
+            continue
+        active = {
+            track_id: [note for note in tracks_notes[track_id] if bar_start <= note["tick"] < bar_end]
+            for track_id in candidates
+        }
+        active = {track_id: notes for track_id, notes in active.items() if notes}
+        if not active:
+            continue
+        track_id, bar_notes = max(
+            active.items(),
+            key=lambda item: (_median_pitch(item[1]), -priority_order[item[0]]),
+        )
+        is_upper_harmony = track_id != candidates[0] and len(active) >= 2
+        if _is_dense_simultaneous_harmony(active):
+            # A long chord wall needs both guitar parts to show its changes.
+            # Keep their source pitches together; mapper.py deduplicates octave
+            # doubles and limits the emitted shape to three playable lanes.
+            for active_track, notes in active.items():
+                if active_track == track_id:
+                    blended.extend([{**note, "harmony_voice": True} for note in notes])
+                else:
+                    blended.extend(notes)
+            label = f"{name} (bar {bar_index + 1})" if len(span_bars) > 1 else name
+            choices.append({"section": label, "start_tick": bar_start, "track": track_id})
+            continue
+        if is_upper_harmony:
+            bar_notes = [{**note, "harmony_voice": True} for note in bar_notes]
         blended.extend(bar_notes)
         label = f"{name} (bar {bar_index + 1})" if len(span_bars) > 1 else name
         choices.append({"section": label, "start_tick": bar_start, "track": track_id})

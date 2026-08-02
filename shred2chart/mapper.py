@@ -73,6 +73,11 @@ TAP_FLAG = 6
 
 _MAX_LANE = 4  # lanes are 0-4; OPEN_NOTE(7) lives outside this range
 _REST_RESET_TICKS = IR_TICKS_PER_QUARTER * 4  # 1 bar
+# Repeated phrase families must see their later turnaround too.  Sixteen onset
+# groups reaches beyond a typical one-bar chug prefix without globally
+# re-mapping the section.
+_BAR_HEADROOM_LOOKAHEAD = 16  # local re-anchor only; section starts see the whole section
+_RIFF_PREFIX_EVENTS = 4  # a repeated phrase must contain at least four exact note events
 
 _RECENT_SHAPES = 4   # how many past chord shapes count as "recently used"
 _TREND_WINDOW = 4    # how many past anchor pitches the direction trend spans
@@ -89,6 +94,10 @@ _WEIGHT_RECENT_REPEAT = -0.5      # matches a shape used a couple of chords ago
 _WEIGHT_UNJUSTIFIED_REPEAT = -3.0  # exact previous shape, content changed
 _WEIGHT_CONTRARY_JUMP = -2.0      # anchor moves against the established direction
 _WEIGHT_STABILITY = 3.0           # exact previous shape, content unchanged
+_WEIGHT_HARMONY_SPREAD = 4.0      # upper twin-guitar voice: retain a visibly wider two-note shape
+_WEIGHT_HARMONY_TRIAD_SPREAD = 4.0  # dense twin-guitar wall: avoid adjacent three-button blocks
+_CHORD_CHANGE_WINDOW_TICKS = IR_TICKS_PER_QUARTER * 4  # one 4/4 bar
+_DENSE_CHORD_CHANGES = 2  # distinct chord changes in one bar enable expressive voicings
 
 _logger = logging.getLogger(__name__)
 
@@ -187,20 +196,23 @@ class _ContourTracker:
         self._last_group_pitches: tuple[int, ...] | None = None
         self._recent_group_lanes: list[tuple[int, ...]] = []
         self._recent_anchor_pitches: list[int] = []
+        self._riff_shapes: dict[tuple[int, ...], tuple[int, ...]] = {}
+        self._recent_chord_change_ticks: list[int] = []
 
-    def reset(self) -> None:
-        self._lane_cursor = 0
+    def reset(self, initial_lane: int = 0, *, preserve_riff_shapes: bool = False) -> None:
+        self._lane_cursor = initial_lane
         self._last_pitch = None
         self._last_tick = None
         self._last_group_lanes = None
         self._last_group_pitches = None
         self._recent_group_lanes = []
         self._recent_anchor_pitches = []
+        self._recent_chord_change_ticks = []
+        if not preserve_riff_shapes:
+            self._riff_shapes = {}
 
     def raw_lane(self, pitch: int, ir_tick: int) -> int:
         """Advance the cursor for `pitch` and return its lane (0-4)."""
-        if self._last_tick is not None and ir_tick - self._last_tick >= _REST_RESET_TICKS:
-            self.reset()
         self._last_tick = ir_tick
 
         if self._last_pitch is None:
@@ -252,6 +264,8 @@ def _rank_chord_shape(
     recent_lanes: list[tuple[int, ...]],
     anchor_preferred_lane: int,
     direction: int,
+    harmony_voice: bool,
+    expressive_progression: bool,
 ) -> tuple[float, dict[str, float]]:
     """Rank one candidate chord shape. This expresses a PREFERENCE among
     several musically-legitimate options, not an objective correctness
@@ -313,6 +327,15 @@ def _rank_chord_shape(
     span = max(candidate) - min(candidate) + 1
     if span == len(candidate):
         breakdown["readable"] = _WEIGHT_READABLE
+
+    # The blend stage marks notes chosen from a higher simultaneous guitar
+    # voice. A wide dyad makes that audible register lift visible on the
+    # highway (G/R -> R/B), rather than treating it as a new adjacent chord
+    # (G/R -> R/Y).
+    if (harmony_voice or expressive_progression) and len(candidate) == 2 and span == 3:
+        breakdown["harmony_spread"] = _WEIGHT_HARMONY_SPREAD
+    if (harmony_voice or expressive_progression) and len(candidate) == 3 and span == 4:
+        breakdown["harmony_triad_spread"] = _WEIGHT_HARMONY_TRIAD_SPREAD
 
     # Small nudge against oscillating back onto a shape used a couple of
     # chords ago, independent of the exact-previous-repeat check below.
@@ -407,6 +430,15 @@ def _assign_group_lanes(
     if len(kept) > _MAX_CHORD_PITCHES:
         dropped = kept[_MAX_CHORD_PITCHES:]
         kept = kept[:_MAX_CHORD_PITCHES]
+        # A same-pitch double recorded earlier can point at a representative
+        # that is itself about to be capped. Re-home that double on the
+        # highest kept pitch before assigning lanes, otherwise the later
+        # extras pass dereferences a note that has no lane.
+        dropped_ids = {id(note) for note in dropped}
+        extras = [
+            (note, kept[-1] if id(representative) in dropped_ids else representative)
+            for note, representative in extras
+        ]
         for note in dropped:
             extras.append((note, kept[-1]))
 
@@ -432,33 +464,55 @@ def _assign_group_lanes(
 
     anchor_pitch = fretted[0]["pitch"] or 0
     current_pitches = tuple(n["pitch"] or 0 for n in fretted)
+    harmony_voice = any(note.get("harmony_voice") for note in fretted)
 
     trend_ref = contour._recent_anchor_pitches[0] if contour._recent_anchor_pitches else None
     direction = 0 if trend_ref is None else (anchor_pitch > trend_ref) - (anchor_pitch < trend_ref)
 
     anchor_preferred_lane = contour.raw_lane(anchor_pitch, ir_tick)
 
+    # Dense chord progressions deserve expressive shapes, whereas an
+    # isolated chord change should not abruptly turn into a wide reach.
+    # Keep a one-bar rolling history of *distinct* chord changes; repeated
+    # chugs deliberately add nothing here and preserve their established
+    # lane shape.
+    if contour._last_group_pitches is not None and current_pitches != contour._last_group_pitches:
+        contour._recent_chord_change_ticks.append(ir_tick)
+    contour._recent_chord_change_ticks = [
+        tick for tick in contour._recent_chord_change_ticks
+        if tick >= ir_tick - _CHORD_CHANGE_WINDOW_TICKS
+    ]
+    expressive_progression = len(contour._recent_chord_change_ticks) >= _DENSE_CHORD_CHANGES
+
     if len(fretted) <= _MAX_LANE + 1:
         prev_lanes = contour._last_group_lanes
         prev_pitches = contour._last_group_pitches
 
-        scored = [
-            (
-                *_rank_chord_shape(
-                    c, current_pitches, prev_lanes, prev_pitches,
-                    contour._recent_group_lanes, anchor_preferred_lane, direction,
-                ),
-                c,
+        cached_shape = contour._riff_shapes.get(current_pitches)
+        if cached_shape is not None and len(cached_shape) == len(fretted):
+            winner = cached_shape
+            scored = []
+        else:
+            scored = [
+                (
+                    *_rank_chord_shape(
+                        c, current_pitches, prev_lanes, prev_pitches,
+                        contour._recent_group_lanes, anchor_preferred_lane, direction,
+                        harmony_voice, expressive_progression,
+                    ),
+                    c,
+                )
+                for c in _chord_shape_candidates(len(fretted))
+            ]
+
+            _, _, winner = max(
+                scored,
+                key=lambda item: (item[0], -abs(item[2][0] - anchor_preferred_lane), tuple(-x for x in item[2])),
             )
-            for c in _chord_shape_candidates(len(fretted))
-        ]
 
-        _, _, winner = max(
-            scored,
-            key=lambda item: (item[0], -abs(item[2][0] - anchor_preferred_lane), tuple(-x for x in item[2])),
-        )
-
-        if _logger.isEnabledFor(logging.DEBUG):
+        if cached_shape is not None and _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug("chord @ tick=%s reuses section riff shape=%s", ir_tick, winner)
+        elif _logger.isEnabledFor(logging.DEBUG):
             for total, breakdown, c in scored:
                 _logger.debug(
                     "chord @ tick=%s candidate=%s rank=%.1f breakdown=%s%s",
@@ -508,6 +562,7 @@ def _assign_group_lanes(
 
     contour._last_group_lanes = tuple(lanes[id(n)] for n in fretted)
     contour._last_group_pitches = current_pitches
+    contour._riff_shapes.setdefault(current_pitches, contour._last_group_lanes)
     contour._recent_group_lanes.append(contour._last_group_lanes)
     if len(contour._recent_group_lanes) > _RECENT_SHAPES:
         contour._recent_group_lanes.pop(0)
@@ -518,28 +573,278 @@ def _assign_group_lanes(
     return lanes
 
 
+def _plan_phrase_start_lanes(
+    groups: dict[int, list[dict[str, Any]]],
+    section_ticks: set[int],
+    bar_ticks: set[int],
+) -> dict[int, tuple[int, bool]]:
+    """Choose each phrase's starting lane before emitting its notes.
+
+    Section/rest starts use the whole remaining phrase, because Guitar Pro
+    gives us the complete tab before we emit any lane. This avoids spending
+    all of the highway at a phrase opening and discovering a needless wrap
+    several measures later. A regular bar-line re-anchor remains deliberately
+    local: it only catches a compact descending figure that has no explicit
+    rest or section boundary.
+    """
+    ticks = sorted(groups)
+    if not ticks:
+        return {}
+
+    hard_starts = [ticks[0]]
+    section_starts = {ticks[0]}
+    for previous, current in zip(ticks, ticks[1:]):
+        crossed_section = any(previous < marker <= current for marker in section_ticks)
+        if crossed_section or current - previous >= _REST_RESET_TICKS:
+            hard_starts.append(current)
+            if crossed_section:
+                section_starts.add(current)
+
+    starts = list(hard_starts)
+
+    # A bar line may start a compact descending figure without a literal
+    # rest or GP section marker. Re-anchor only when its *opening* contour
+    # descends and never rises; ordinary bar boundaries remain continuous.
+    for start in ticks:
+        if start not in bar_ticks or start in starts:
+            continue
+        anchors = [
+            min(note["pitch"] or 0 for note in groups[tick])
+            for tick in ticks[ticks.index(start):ticks.index(start) + _BAR_HEADROOM_LOOKAHEAD]
+        ]
+        offsets = [0]
+        for previous, current in zip(anchors, anchors[1:]):
+            step = _interval_to_step(current - previous)
+            offsets.append(offsets[-1] + (step if current > previous else -step if current < previous else 0))
+        if min(offsets) < 0 and max(offsets) <= 0:
+            starts.append(start)
+
+    starts.sort()
+
+    plans: dict[int, tuple[int, bool]] = {}
+    for start in starts:
+        if start in hard_starts:
+            end = next((boundary for boundary in hard_starts if boundary > start), None)
+            phrase_ticks = [tick for tick in ticks if start <= tick and (end is None or tick < end)]
+        else:
+            start_index = ticks.index(start)
+            phrase_ticks = ticks[start_index:start_index + _BAR_HEADROOM_LOOKAHEAD]
+        anchors = [
+            min(note["pitch"] or 0 for note in groups[tick])
+            for tick in phrase_ticks
+        ]
+        offset = 0
+        minimum = maximum = 0
+        for previous, current in zip(anchors, anchors[1:]):
+            step = _interval_to_step(current - previous)
+            offset += step if current > previous else -step if current < previous else 0
+            minimum = min(minimum, offset)
+            maximum = max(maximum, offset)
+
+        legal = [lane for lane in range(_MAX_LANE + 1) if lane + minimum >= 0 and lane + maximum <= _MAX_LANE]
+        if legal:
+            lane = min(legal, key=lambda lane: abs(lane))
+        else:
+            # A phrase wider than five lanes must eventually wrap. Start at
+            # the least-overflowing position, preferring lower lanes on ties.
+            lane = min(
+                range(_MAX_LANE + 1),
+                key=lambda lane: (
+                    max(0, -(lane + minimum)) + max(0, lane + maximum - _MAX_LANE),
+                    lane,
+                ),
+            )
+        # A rest resets contour motion, but not the section's established
+        # riff vocabulary. Only a true section marker starts a new cache.
+        plans[start] = (lane, start not in section_starts)
+    return plans
+
+
+def _group_fingerprint(group: list[dict[str, Any]]) -> tuple[tuple[int | None, int | None, int | None], ...]:
+    """Exact played notes for one onset, independent of their chart lanes."""
+    return tuple(sorted((note.get("string"), note.get("fret"), note.get("pitch")) for note in group))
+
+
+def _find_repeated_measure_sources(
+    groups: dict[int, list[dict[str, Any]]],
+    bar_ticks: list[int] | None,
+) -> dict[int, int]:
+    """Map later identical source measures to the first matching measure.
+
+    Each fingerprint contains every fretted-note onset and its offset within
+    the measure. A repeated complete bar therefore replays the lane pattern
+    already established by its earlier appearance, without guessing that a
+    partial note run is the same musical idea.
+    """
+    if not bar_ticks:
+        return {}
+    starts = sorted(set(bar_ticks))
+    sources: dict[int, int] = {}
+    first_measures: dict[tuple, tuple[int, list[int]]] = {}
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else float("inf")
+        ticks = [tick for tick in sorted(groups) if start <= tick < end]
+        if not ticks:
+            continue
+        fingerprint = tuple((tick - start, _group_fingerprint(groups[tick])) for tick in ticks)
+        original = first_measures.get(fingerprint)
+        if original is None:
+            first_measures[fingerprint] = (start, ticks)
+            continue
+        _, original_ticks = original
+        if len(original_ticks) != len(ticks):
+            continue
+        for current_tick, original_tick in zip(ticks, original_ticks):
+            sources[current_tick] = original_tick
+    return sources
+
+
+def _find_repeated_phrase_sources(
+    groups: dict[int, list[dict[str, Any]]],
+    section_ticks: list[int] | None,
+    bar_ticks: list[int] | None,
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Find exact repeated phrase prefixes within one named section.
+
+    This complements whole-measure memory for cases where a riff repeats its
+    opening chugs but changes at the tail (for example, a later lower-fret
+    turnaround). It never crosses a section boundary and requires four
+    matching fretted-note events with matching internal rhythm.
+    """
+    ticks = sorted(groups)
+    width = _RIFF_PREFIX_EVENTS
+    if len(ticks) < width * 2:
+        return {}, {}
+    boundaries = sorted(section_ticks or [])
+    bar_set = set(bar_ticks or [])
+
+    def section_at(tick: int) -> int:
+        return sum(boundary <= tick for boundary in boundaries)
+
+    fingerprints = [_group_fingerprint(groups[tick]) for tick in ticks]
+
+    def window_at(start: int) -> tuple:
+        return tuple(
+            (fingerprints[index], ticks[index + 1] - ticks[index] if index < start + width - 1 else None)
+            for index in range(start, start + width)
+        )
+
+    def offset_bounds(start: int) -> tuple[int, int]:
+        # A phrase family at a bar head is planned against that bar's own
+        # continuation.  Crossing into the following measure would let an
+        # unrelated new figure distort this phrase's initial anchor.
+        bar_end = next((bar for bar in sorted(bar_set) if bar > ticks[start]), None)
+        limit = min(start + _BAR_HEADROOM_LOOKAHEAD, len(ticks))
+        if bar_end is not None:
+            limit = min(
+                limit,
+                next((index for index in range(start, len(ticks)) if ticks[index] >= bar_end), len(ticks)),
+            )
+        anchors = [
+            min(note["pitch"] or 0 for note in groups[ticks[index]])
+            for index in range(start, limit)
+        ]
+        offset = minimum = maximum = 0
+        for previous, current in zip(anchors, anchors[1:]):
+            step = _interval_to_step(current - previous)
+            offset += step if current > previous else -step if current < previous else 0
+            minimum = min(minimum, offset)
+            maximum = max(maximum, offset)
+        return minimum, maximum
+
+    def lane_for_bounds(minimum: int, maximum: int) -> int:
+        legal = [lane for lane in range(_MAX_LANE + 1) if lane + minimum >= 0 and lane + maximum <= _MAX_LANE]
+        if legal:
+            return min(legal, key=lambda lane: abs(lane))
+        return min(
+            range(_MAX_LANE + 1),
+            key=lambda lane: (
+                max(0, -(lane + minimum)) + max(0, lane + maximum - _MAX_LANE),
+                lane,
+            ),
+        )
+
+    sources: dict[int, int] = {}
+    matches: list[tuple[int, int]] = []
+    first_windows: dict[tuple[int, tuple], int] = {}
+    for start in range(len(ticks) - width + 1):
+        if bar_set and ticks[start] not in bar_set:
+            continue
+        key = (section_at(ticks[start]), window_at(start))
+        original = first_windows.setdefault(key, start)
+        if original == start or start < original + width:
+            continue
+        length = width
+        while (
+            original + length < len(ticks)
+            and start + length < len(ticks)
+            and section_at(ticks[original + length]) == section_at(ticks[start + length])
+            and fingerprints[original + length] == fingerprints[start + length]
+            and (original + length == len(ticks) - 1 or start + length == len(ticks) - 1
+                 or ticks[original + length + 1] - ticks[original + length]
+                 == ticks[start + length + 1] - ticks[start + length])
+        ):
+            length += 1
+        for offset in range(length):
+            sources.setdefault(ticks[start + offset], ticks[original + offset])
+        matches.append((original, start))
+
+    # Plan against the closest repeated occurrence.  A phrase can recur again
+    # much later in a section with a genuinely different continuation; that
+    # must not force the original chug prefix into an artificial compromise.
+    # The immediate variation is the useful evidence for the local anchor.
+    anchor_bounds: dict[int, tuple[int, int]] = {}
+    closest_matches: dict[int, int] = {}
+    for original, current in matches:
+        closest_matches.setdefault(original, current)
+    for original, current in closest_matches.items():
+        original_bounds = offset_bounds(original)
+        current_bounds = offset_bounds(current)
+        existing = anchor_bounds.get(ticks[original], original_bounds)
+        anchor_bounds[ticks[original]] = (
+            min(existing[0], original_bounds[0], current_bounds[0]),
+            max(existing[1], original_bounds[1], current_bounds[1]),
+        )
+    return sources, {
+        tick: lane_for_bounds(minimum, maximum)
+        for tick, (minimum, maximum) in anchor_bounds.items()
+    }
+
+
 def map_notes(
     ir_notes: list[dict[str, Any]],
     section_ticks: list[int] | None = None,
+    bar_ticks: list[int] | None = None,
 ) -> list[ChartNote]:
     notes = _merge_ties(ir_notes)
     chug_string = _lowest_tuning_string(notes)
-    section_set: set[int] = set(section_ticks or [])
-
-    contour = _ContourTracker()
-
     groups: dict[int, list[dict[str, Any]]] = {}
     for note in notes:
         groups.setdefault(note["tick"], []).append(note)
 
+    phrase_starts = _plan_phrase_start_lanes(
+        groups, set(section_ticks or []), set(bar_ticks or []),
+    )
+    measure_sources = _find_repeated_measure_sources(groups, bar_ticks)
+    phrase_sources, phrase_anchor_lanes = _find_repeated_phrase_sources(
+        groups, section_ticks, bar_ticks,
+    )
+    replay_sources = {**phrase_sources, **measure_sources}
+    contour = _ContourTracker()
+    emitted_lanes: dict[int, list[int]] = {}
+
     chart_notes: list[ChartNote] = []
     for ir_tick, group in sorted(groups.items()):
-        if ir_tick in section_set:
-            contour.reset()
+        if ir_tick in phrase_starts:
+            initial_lane, preserve_riff_shapes = phrase_starts[ir_tick]
+            contour.reset(initial_lane, preserve_riff_shapes=preserve_riff_shapes)
+        if ir_tick in phrase_anchor_lanes:
+            contour.reset(phrase_anchor_lanes[ir_tick], preserve_riff_shapes=True)
 
         lane_by_id = _assign_group_lanes(group, chug_string, contour, ir_tick)
         duration = max(n["duration_ticks"] for n in group)
-        lanes = sorted(set(lane_by_id.values()))
+        lanes = emitted_lanes.get(replay_sources.get(ir_tick), sorted(set(lane_by_id.values())))
+        emitted_lanes[ir_tick] = lanes
         chart_notes.append(
             ChartNote(
                 tick=_to_chart_ticks(ir_tick),

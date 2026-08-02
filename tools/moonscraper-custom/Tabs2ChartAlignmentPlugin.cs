@@ -21,6 +21,9 @@ public class Tabs2ChartAlignmentPlugin : BaseUnityPlugin
                 return;
             }
         }
+
+        gameObject.AddComponent<Tabs2ChartMeasureCounter>();
+        Logger.LogInfo("Tabs2Chart measure counter enabled.");
     }
 }
 
@@ -124,12 +127,66 @@ public class Tabs2ChartAlignmentGuide : MonoBehaviour
 
     void OnGUI()
     {
+        DrawMeasureCounter();
+
         if (!visible)
         {
             GUI.Box(new Rect(340, 52, 225, 27), "Tabs2Chart alignment: F8 to show");
             return;
         }
         windowRect = GUI.Window(GetInstanceID(), windowRect, DrawWindow, "Tabs2Chart Audio Alignment");
+    }
+
+    void DrawMeasureCounter()
+    {
+        if (editor == null || editor.currentSong == null)
+            return;
+
+        GUIStyle style = new GUIStyle(GUI.skin.label);
+        style.fontSize = 20;
+        style.normal.textColor = Color.yellow;
+        GUI.Label(
+            new Rect(20, 20, 330, 28),
+            "Measure " + GetMeasureNumber(editor.currentSong, editor.currentTickPos) +
+                "  (tick " + editor.currentTickPos + ")",
+            style
+        );
+    }
+
+    // Counts the same measure starts DrawBeatLines renders. A time-signature
+    // change itself is always a new visible measure line, including malformed
+    // charts that place it mid-measure, so completed segments use ceiling
+    // division while the current segment uses floor division.
+    internal static int GetMeasureNumber(Song song, uint tick)
+    {
+        var timeSignatures = song.timeSignatures;
+        if (timeSignatures.Count == 0)
+            return 1;
+
+        int measureNumber = 1;
+        for (int i = 0; i < timeSignatures.Count; ++i)
+        {
+            TimeSignature ts = timeSignatures[i];
+            if (tick < ts.tick)
+                break;
+
+            uint measureLength = ts.GetMeasureInfo().measureLine.tickGap;
+            if (measureLength == 0)
+                continue;
+
+            uint nextTSTick = i + 1 < timeSignatures.Count
+                ? timeSignatures[i + 1].tick
+                : uint.MaxValue;
+            if (tick < nextTSTick)
+            {
+                measureNumber += (int)((tick - ts.tick) / measureLength);
+                break;
+            }
+
+            uint segmentLength = nextTSTick - ts.tick;
+            measureNumber += (int)((segmentLength + measureLength - 1) / measureLength);
+        }
+        return measureNumber;
     }
 
     void DrawWindow(int id)
@@ -164,5 +221,27 @@ public class Tabs2ChartAlignmentGuide : MonoBehaviour
         GUILayout.EndHorizontal();
         GUILayout.Label("F8 hides/shows this guide. Save the chart to keep the offset.");
         GUI.DragWindow(new Rect(0, 0, 10000, 22));
+    }
+}
+
+// The alignment guide activates only for manifest-backed Tabs2Chart imports,
+// but the counter is useful when manually comparing any chart with a tab.
+public class Tabs2ChartMeasureCounter : MonoBehaviour
+{
+    void OnGUI()
+    {
+        ChartEditor editor = ChartEditor.Instance;
+        if (editor == null || editor.currentSong == null)
+            return;
+
+        GUIStyle style = new GUIStyle(GUI.skin.label);
+        style.fontSize = 20;
+        style.normal.textColor = Color.yellow;
+        GUI.Label(
+            new Rect(20, 20, 330, 28),
+            "Measure " + Tabs2ChartAlignmentGuide.GetMeasureNumber(editor.currentSong, editor.currentTickPos) +
+                "  (tick " + editor.currentTickPos + ")",
+            style
+        );
     }
 }

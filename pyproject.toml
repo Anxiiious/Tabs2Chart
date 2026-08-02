@@ -1,4 +1,4 @@
-﻿[project]
+[project]
 name = "shred2chart"
 version = "0.1.0"
 description = "Convert Sheet Happens Guitar Pro tabs into Clone Hero charts"
@@ -15,9 +15,12 @@ shred2chart-gui = "shred2chart.gui:main"
 dev = [
     "pytest>=7.0",
     "argcomplete>=3.0",
+    "PySide6-Essentials>=6.6",
 ]
 gui = [
-    "tkinterdnd2>=0.4",
+    # Essentials, not the full PySide6 metapackage: Addons roughly doubles the
+    # install and the importer only uses QtWidgets/QtGui/QtCore/QtSvg.
+    "PySide6-Essentials>=6.6",
 ]
 
 [build-system]

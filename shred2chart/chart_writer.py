@@ -12,6 +12,7 @@ the game plan's "do not code note flags from memory" mandate:
 - [ExpertSingle]: `tick = N <type> <length>`; 0-4 = green..orange,
   5 = strum/HOPO flip modifier, 6 = tap modifier, 7 = open. Modifier
   lines sit at the same tick as the note they modify.
+- Star Power: `tick = S 2 <length>`; phrases are measured in chart ticks.
 """
 from __future__ import annotations
 
@@ -30,6 +31,50 @@ from .mapper import (
 from .validation import escape_metadata
 
 DEFAULT_LEAD_IN_BARS = 2
+STAR_POWER_BARS = 2
+STAR_POWER_MIN_NOTES = 8
+STAR_POWER_LOOKAHEAD_BARS = 6
+
+
+def auto_star_power_phrases(
+    chart_notes: list[ChartNote],
+    bar_starts: list[int],
+    sections: list[dict[str, Any]],
+) -> list[tuple[int, int]]:
+    """Choose conservative, playable two-bar Star Power phrases.
+
+    A phrase is never empty, starts at a real source bar, stays within one
+    named section, and is selected from the densest window in each roughly
+    six-bar look-ahead.  That yields about one opportunity per 10--20 seconds
+    at ordinary tempos without pretending to optimize activation paths.
+    """
+    if len(chart_notes) < 50:
+        return []
+    bars = sorted({_to_chart_ticks(tick) for tick in bar_starts})
+    if len(bars) <= STAR_POWER_BARS:
+        return []
+    section_ticks = {_to_chart_ticks(section["tick"]) for section in sections}
+    first_note = min(note.tick for note in chart_notes)
+    cursor = max((i for i, start in enumerate(bars) if start <= first_note), default=0)
+    phrases: list[tuple[int, int]] = []
+    last_start = len(bars) - STAR_POWER_BARS
+    while cursor < last_start:
+        candidates: list[tuple[int, int]] = []
+        for index in range(cursor, min(cursor + STAR_POWER_LOOKAHEAD_BARS, last_start + 1)):
+            start, end = bars[index], bars[index + STAR_POWER_BARS]
+            if any(start < section_tick < end for section_tick in section_ticks):
+                continue
+            note_count = sum(start <= note.tick < end for note in chart_notes)
+            if note_count >= STAR_POWER_MIN_NOTES:
+                candidates.append((note_count, index))
+        if not candidates:
+            cursor += STAR_POWER_LOOKAHEAD_BARS
+            continue
+        _, index = max(candidates, key=lambda item: (item[0], -item[1]))
+        start, end = bars[index], bars[index + STAR_POWER_BARS]
+        phrases.append((start, end - start))
+        cursor = index + STAR_POWER_LOOKAHEAD_BARS
+    return phrases
 
 
 def add_lead_in(
@@ -112,7 +157,10 @@ def _events_lines(sections: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def _note_lines(chart_notes: list[ChartNote]) -> list[str]:
+def _note_lines(
+    chart_notes: list[ChartNote],
+    star_power_phrases: list[tuple[int, int]] | None = None,
+) -> list[str]:
     lines = []
     for note in chart_notes:
         for lane in note.lanes:
@@ -121,6 +169,8 @@ def _note_lines(chart_notes: list[ChartNote]) -> list[str]:
             lines.append(f"  {note.tick} = N {TAP_FLAG} 0")
         elif note.forced:
             lines.append(f"  {note.tick} = N {FORCED_FLAG} 0")
+    for tick, duration in star_power_phrases or []:
+        lines.append(f"  {tick} = S 2 {duration}")
     return lines
 
 
@@ -170,6 +220,7 @@ def build_chart(
     chart_notes: list[ChartNote],
     offset_ms: int = 0,
     charter: str = "shred2chart",
+    star_power_phrases: list[tuple[int, int]] | None = None,
 ) -> str:
     def block(name: str, lines: list[str]) -> str:
         body = "\n".join(lines)
@@ -190,7 +241,7 @@ def build_chart(
         block("Song", song_lines),
         block("SyncTrack", _sync_track_lines(tempo_events)),
         block("Events", _events_lines(sections)),
-        block("ExpertSingle", _note_lines(chart_notes)),
+        block("ExpertSingle", _note_lines(chart_notes, star_power_phrases)),
     ]
     return "\n".join(parts)
 
@@ -225,12 +276,16 @@ def write_song_folder(
     tempo_events: list[dict[str, Any]],
     sections: list[dict[str, Any]],
     chart_notes: list[ChartNote],
+    star_power_phrases: list[tuple[int, int]] | None = None,
     offset_ms: int = 0,
     charter: str = "shred2chart",
 ) -> Path:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    chart_text = build_chart(title, artist, tempo_events, sections, chart_notes, offset_ms, charter)
+    chart_text = build_chart(
+        title, artist, tempo_events, sections, chart_notes,
+        offset_ms=offset_ms, charter=charter, star_power_phrases=star_power_phrases,
+    )
     song_length_ms = compute_song_length_ms(chart_notes, tempo_events)
     (out_path / "notes.chart").write_text(chart_text, encoding="utf-8")
     (out_path / "song.ini").write_text(

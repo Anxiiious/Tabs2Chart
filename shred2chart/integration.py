@@ -10,6 +10,30 @@ from typing import Any
 
 
 MANIFEST_SCHEMA = "https://tabs2chart.dev/schemas/moon-scraper-manifest.v1.json"
+IMPORT_SETTINGS_FILENAME = "tabs2chart-import.json"
+
+
+def write_import_settings(out_dir: str | Path, settings: dict[str, Any]) -> Path:
+    """Persist the editable inputs used to generate one song folder."""
+    output = Path(out_dir)
+    path = output / IMPORT_SETTINGS_FILENAME
+    payload = {"version": 1, **settings}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def read_import_settings(song_dir: str | Path) -> dict[str, Any]:
+    """Load settings from a generated song folder for GUI re-editing."""
+    path = Path(song_dir)
+    if path.is_dir():
+        path = path / IMPORT_SETTINGS_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not read {IMPORT_SETTINGS_FILENAME}: {exc}") from exc
+    if payload.get("version") != 1 or not isinstance(payload.get("inputs"), dict):
+        raise ValueError(f"{IMPORT_SETTINGS_FILENAME} is not a supported Tabs2Chart import record")
+    return payload
 
 
 def _split_command(command: str) -> list[str]:

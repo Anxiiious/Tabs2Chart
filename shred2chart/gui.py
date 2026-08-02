@@ -1,543 +1,1099 @@
-"""Small desktop importer for turning a Guitar Pro tab + recording into a
+"""Desktop importer for turning a Guitar Pro tab + recording into a
 ready-to-scan Clone Hero song folder.
 
-Run unpackaged with `python -m shred2chart.gui`, or via the installed
-`shred2chart-gui` console script. For a standalone .exe, package this
-module's `main()` with PyInstaller (see packaging/gui_entry.py).
+Qt (PySide6) front end.  Run unpackaged with `python -m shred2chart.gui`, or via
+the installed `shred2chart-gui` console script.  For a standalone .exe, package
+this module's `main()` with PyInstaller (see packaging/gui_entry.py).
+
+The legacy Tk implementation is kept at gui_tk_legacy.py as an unmaintained
+fallback; all shared pure logic lives in gui_common.py.
 """
 from __future__ import annotations
 
-import json
 import os
-import queue
-import re
-import threading
-import tkinter as tk
+import sys
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    _DND_AVAILABLE = True
-except ImportError:
-    _DND_AVAILABLE = False
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
-from . import media
-from .cli import ConvertError, convert_song, peek_metadata
+from . import integration, media, qt_theme
+from .cli import ConvertError, convert_song, get_source_measure_info, peek_metadata
+from .gui_common import (  # noqa: F401 - re-exported for tests and back-compat
+    _AUDIO_FILETYPES,
+    _CONFIG_PATH,
+    _GP_FILETYPES,
+    _GP_SUFFIXES,
+    _IMAGE_FILETYPES,
+    _MOONSCRAPER_FILETYPES,
+    _load_config,
+    _parse_dnd_path,
+    _save_config,
+    _song_output_dir,
+    _suggest_companion_files,
+    qt_filter,
+)
 from .moonscraper import MoonscraperLaunchError, find_moonscraper, open_chart
 
-_GP_SUFFIXES = {".gp", ".gpx", ".gp3", ".gp4", ".gp5"}
-_GP_FILETYPES = [
-    ("Guitar Pro files", "*.gp *.gpx *.gp3 *.gp4 *.gp5"),
-    ("All files", "*.*"),
-]
-_AUDIO_FILETYPES = [
-    ("Audio files", " ".join(f"*{ext}" for ext in sorted(media.AUDIO_EXTENSIONS))),
-    ("All files", "*.*"),
-]
-_IMAGE_FILETYPES = [
-    ("Image files", " ".join(f"*{ext}" for ext in sorted(media.IMAGE_EXTENSIONS))),
-    ("All files", "*.*"),
-]
-_MOONSCRAPER_FILETYPES = [
-    ("MoonScraper Chart Editor", "Moonscraper Chart Editor.exe"),
-    ("Windows applications", "*.exe"),
-]
-
-_CONFIG_PATH = Path.home() / ".shred2chart" / "gui_config.json"
-
-_AppBase = TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk
+_ACCEPTED_SUFFIXES = {
+    "gp": _GP_SUFFIXES,
+    "audio": media.AUDIO_EXTENSIONS,
+    "image": media.IMAGE_EXTENSIONS,
+    "exe": {".exe"},
+    "dir": set(),  # handled by is_dir(), not by suffix
+}
 
 
-def _parse_dnd_path(data: str) -> str:
-    """Return the first path from a Tk DND payload.
+# ------------------------------------------------------------------ widgets --
 
-    Tk wraps paths containing spaces in braces and may send several paths in
-    one payload.  The importer intentionally accepts only the first.
-    """
-    data = data.strip()
-    match = re.match(r'^(?:\{([^}]*)\}|"([^"]*)"|(\S+))', data)
-    if not match:
-        return data
-    return next(group for group in match.groups() if group is not None)
-
-
-def _suggest_companion_files(gp_file: str | Path) -> tuple[Path | None, Path | None]:
-    """Find same-folder audio and artwork that likely belong to *gp_file*."""
-    path = Path(gp_file)
-    if not path.is_file():
-        return None, None
-
-    audio = next(
-        (
-            path.with_suffix(ext)
-            for ext in sorted(media.AUDIO_EXTENSIONS)
-            if path.with_suffix(ext).is_file()
-        ),
-        None,
-    )
-    art = next(
-        (
-            path.with_suffix(ext)
-            for ext in sorted(media.IMAGE_EXTENSIONS)
-            if path.with_suffix(ext).is_file()
-        ),
-        None,
-    )
-    if art is None:
-        for name in ("cover", "folder", "album"):
-            art = next(
-                (
-                    path.parent / f"{name}{ext}"
-                    for ext in sorted(media.IMAGE_EXTENSIONS)
-                    if (path.parent / f"{name}{ext}").is_file()
-                ),
-                None,
-            )
-            if art is not None:
-                break
-    return audio, art
+def _tracked_font(size: int, weight: QFont.Weight, spacing: float = 0.0) -> QFont:
+    """Qt style sheets have no letter-spacing, so tracked type is set in code."""
+    font = QFont()
+    font.setPixelSize(size)
+    font.setWeight(weight)
+    if spacing:
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
+    return font
 
 
-def _song_output_dir(root: str | Path, artist: str, title: str) -> Path:
-    """Build the final song folder beneath a user-selected Songs directory."""
-    from .cli import _safe_path_part  # noqa: PLC0415
-
-    return Path(root).expanduser() / f"{_safe_path_part(artist)} - {_safe_path_part(title)}"
-
-
-def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+def chip(text: str, kind: str = "") -> QLabel:
+    label = QLabel(text)
+    label.setObjectName("Chip" + kind)
+    label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+    return label
 
 
-def _save_config(config: dict) -> None:
-    try:
-        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_PATH.write_text(json.dumps(config), encoding="utf-8")
-    except OSError:
-        pass
+def eyebrow(text: str) -> QLabel:
+    label = QLabel(text.upper())
+    label.setObjectName("Eyebrow")
+    label.setFont(_tracked_font(10, QFont.Weight.Bold, 1.1))
+    return label
 
 
-class App(_AppBase):
-    def __init__(self):
-        super().__init__()
-        self.title("Tabs2Chart Importer")
-        self.geometry("720x710")
-        self.minsize(640, 520)
+class Card(QFrame):
+    """Rounded translucent panel, optionally with a cyan accent rail."""
 
-        self._log_queue: queue.Queue[str] = queue.Queue()
-        self._out_dir: Path | None = None
-        self._converting = False
-        self._config = _load_config()
+    def __init__(
+        self,
+        title: str | None = None,
+        *,
+        accent: bool = False,
+        header_extra: QWidget | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("Card")
 
-        self.gp_file = tk.StringVar()
-        self.audio_file = tk.StringVar()
-        self.album_art_file = tk.StringVar()
-        self.out_dir_var = tk.StringVar()
-        self.out_preview_var = tk.StringVar(value="Choose a tab to preview the imported song.")
-        self.metadata_var = tk.StringVar(value="No tab selected")
-        self.track = tk.StringVar()
-        self.tracks = tk.StringVar()
-        self.offset_ms = tk.StringVar(value="0")
-        discovered_moonscraper = find_moonscraper(self._config.get("moonscraper_exe"))
-        self.moonscraper_exe = tk.StringVar(
-            value=str(discovered_moonscraper) if discovered_moonscraper else ""
-        )
-        self.open_after_import = tk.BooleanVar(
-            value=bool(self._config.get("open_in_moonscraper", True))
-        )
+        shell = QHBoxLayout(self)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
 
-        self.gp_file.trace_add("write", lambda *_: self._update_preview())
-        self.out_dir_var.trace_add("write", lambda *_: self._update_preview())
+        if accent:
+            rail = QFrame()
+            rail.setObjectName("AccentBar")
+            rail.setFixedWidth(3)
+            wrap = QVBoxLayout()
+            wrap.setContentsMargins(5, 10, 0, 10)
+            wrap.addWidget(rail)
+            shell.addLayout(wrap)
 
-        self._build_widgets()
-        if not _DND_AVAILABLE:
-            self._log("(tip: install 'tkinterdnd2' to enable drag-and-drop file support)")
-        self.after(100, self._poll_log_queue)
+        inner = QVBoxLayout()
+        inner.setContentsMargins(18 if accent else 20, 16, 20, 18)
+        inner.setSpacing(12)
+        shell.addLayout(inner)
 
-    def _build_widgets(self) -> None:
-        pad = {"padx": 8, "pady": 4}
+        if title or header_extra:
+            head = QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(8)
+            if title:
+                head.addWidget(eyebrow(title))
+            head.addStretch(1)
+            if header_extra is not None:
+                head.addWidget(header_extra)
+            inner.addLayout(head)
 
-        main = ttk.Frame(self, padding=10)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(1, weight=1)
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.body.setSpacing(10)
+        inner.addLayout(self.body)
 
-        ttk.Label(main, text="1. Guitar Pro tab:").grid(row=0, column=0, sticky="w", **pad)
-        gp_entry = ttk.Entry(main, textvariable=self.gp_file)
-        gp_entry.grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(main, text="Browse...", command=self._pick_gp_file).grid(row=0, column=2, **pad)
-        self._register_drop(gp_entry, self.gp_file, kind="gp")
 
-        ttk.Label(main, text="2. Song audio:").grid(row=1, column=0, sticky="w", **pad)
-        audio_entry = ttk.Entry(main, textvariable=self.audio_file)
-        audio_entry.grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(main, text="Browse...", command=self._pick_audio_file).grid(row=1, column=2, **pad)
-        self._register_drop(audio_entry, self.audio_file, kind="audio")
+class DropLineEdit(QLineEdit):
+    """Line edit that accepts a dropped file of an expected kind."""
 
-        ttk.Label(main, text="3. Clone Hero Songs folder:").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(main, textvariable=self.out_dir_var).grid(row=2, column=1, sticky="ew", **pad)
-        ttk.Button(main, text="Browse...", command=self._pick_out_dir).grid(row=2, column=2, **pad)
+    pathDropped = Signal(str)
 
-        summary = ttk.LabelFrame(main, text="Import summary")
-        summary.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 4))
-        ttk.Label(summary, textvariable=self.metadata_var, font=("", 11, "bold")).pack(
-            anchor="w", padx=10, pady=(8, 2)
-        )
-        ttk.Label(summary, textvariable=self.out_preview_var, foreground="#555", wraplength=650).pack(
-            anchor="w", padx=10, pady=(0, 8)
-        )
+    def __init__(self, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self.setAcceptDrops(True)
+        self.setClearButtonEnabled(True)
 
-        self.convert_btn = ttk.Button(main, text="Import tab + song", command=self._on_convert)
-        self.convert_btn.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 4))
-
-        self.progress = ttk.Progressbar(main, mode="indeterminate")
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 4))
-
-        advanced = ttk.LabelFrame(main, text="Advanced (optional)")
-        advanced.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 4))
-        advanced.columnconfigure(1, weight=1)
-
-        ttk.Label(advanced, text="Album art:").grid(row=1, column=0, sticky="w", **pad)
-        art_entry = ttk.Entry(advanced, textvariable=self.album_art_file)
-        art_entry.grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(advanced, text="Browse...", command=self._pick_album_art).grid(row=1, column=2, **pad)
-        self._register_drop(art_entry, self.album_art_file, kind="image")
-
-        ttk.Label(advanced, text="Track (verbatim, skip blending):").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(advanced, textvariable=self.track, width=8).grid(row=2, column=1, sticky="w", **pad)
-
-        ttk.Label(advanced, text="Tracks to blend (e.g. 1,0):").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Entry(advanced, textvariable=self.tracks, width=12).grid(row=3, column=1, sticky="w", **pad)
-
-        ttk.Label(advanced, text="Audio offset (ms):").grid(row=4, column=0, sticky="w", **pad)
-        ttk.Entry(advanced, textvariable=self.offset_ms, width=8).grid(row=4, column=1, sticky="w", **pad)
-
-        ttk.Label(advanced, text="MoonScraper app:").grid(row=5, column=0, sticky="w", **pad)
-        ttk.Entry(advanced, textvariable=self.moonscraper_exe).grid(
-            row=5, column=1, sticky="ew", **pad
-        )
-        ttk.Button(
-            advanced, text="Browse...", command=self._pick_moonscraper
-        ).grid(row=5, column=2, **pad)
-        ttk.Checkbutton(
-            advanced,
-            text="Open the generated chart in MoonScraper after import",
-            variable=self.open_after_import,
-            command=self._save_moonscraper_preferences,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", **pad)
-
-        ttk.Label(main, text="Progress:").grid(row=7, column=0, sticky="w", padx=8)
-        log_frame = ttk.Frame(main)
-        log_frame.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=8, pady=(0, 8))
-        main.rowconfigure(8, weight=1)
-
-        scrollbar = ttk.Scrollbar(log_frame)
-        scrollbar.pack(side="right", fill="y")
-        self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled",
-                                 yscrollcommand=scrollbar.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.log_text.yview)
-
-        action_frame = ttk.Frame(main)
-        action_frame.grid(row=9, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 4))
-        action_frame.columnconfigure((0, 1), weight=1)
-        self.open_folder_btn = ttk.Button(
-            action_frame, text="Open output folder", command=self._open_output_folder,
-            state="disabled"
-        )
-        self.open_folder_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.open_moonscraper_btn = ttk.Button(
-            action_frame, text="Open in MoonScraper", command=self._open_in_moonscraper,
-            state="disabled"
-        )
-        self.open_moonscraper_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-
-        self._restore_last_folders()
-
-    def _register_drop(self, widget: tk.Widget, var: tk.StringVar, kind: str) -> None:
-        if not _DND_AVAILABLE:
-            return
-        widget.drop_target_register(DND_FILES)
-
-        def on_drop(event) -> None:
-            path = _parse_dnd_path(event.data)
-            suffix = Path(path).suffix.lower()
-            accepted = {
-                "gp": _GP_SUFFIXES,
-                "audio": media.AUDIO_EXTENSIONS,
-                "image": media.IMAGE_EXTENSIONS,
-            }[kind]
-            if suffix not in accepted:
-                self._log(f"Ignored {Path(path).name}: not a supported {kind} file.")
-                return
-            var.set(path)
-            if kind == "gp":
-                self._on_gp_selected(path)
-
-        widget.dnd_bind("<<Drop>>", on_drop)
-
-    def _restore_last_folders(self) -> None:
-        last_gp_dir = self._config.get("last_gp_dir")
-        if last_gp_dir:
-            self._last_gp_dir = last_gp_dir
-        last_audio_dir = self._config.get("last_audio_dir")
-        if last_audio_dir:
-            self._last_audio_dir = last_audio_dir
-        last_out_dir = self._config.get("last_out_dir")
-        if last_out_dir:
-            self._last_out_dir = last_out_dir
-            self.out_dir_var.set(last_out_dir)
-        else:
-            default_root = Path.cwd() / "songs"
-            self._last_out_dir = str(default_root)
-            self.out_dir_var.set(str(default_root))
-
-    def _update_preview(self) -> None:
-        gp_file = self.gp_file.get().strip()
-        if not gp_file or not Path(gp_file).is_file():
-            self.metadata_var.set("No tab selected")
-            self.out_preview_var.set("Choose a tab to preview the imported song.")
-            return
-        try:
-            artist, title = peek_metadata(gp_file)
-        except Exception as exc:
-            self.metadata_var.set("Could not read this tab")
-            self.out_preview_var.set(str(exc))
-            return
-        self.metadata_var.set(f"{artist} — {title}")
-        root = self.out_dir_var.get().strip() or str(Path.cwd() / "songs")
-        self.out_preview_var.set(f"Ready to import into: {_song_output_dir(root, artist, title)}")
-
-    def _on_gp_selected(self, path: str) -> None:
-        """Populate obvious companion files without replacing user choices."""
-        audio, art = _suggest_companion_files(path)
-        if audio is not None and not self.audio_file.get().strip():
-            self.audio_file.set(str(audio))
-            self._log(f"Matched song audio: {audio.name}")
-        if art is not None and not self.album_art_file.get().strip():
-            self.album_art_file.set(str(art))
-            self._log(f"Matched album art: {art.name}")
-
-    def _pick_gp_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Choose a GP file", filetypes=_GP_FILETYPES,
-            initialdir=getattr(self, "_last_gp_dir", None),
-        )
-        if path:
-            self.gp_file.set(path)
-            self._on_gp_selected(path)
-            self._last_gp_dir = str(Path(path).parent)
-            self._config["last_gp_dir"] = self._last_gp_dir
-            _save_config(self._config)
-
-    def _pick_audio_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Choose an audio file", filetypes=_AUDIO_FILETYPES,
-            initialdir=getattr(self, "_last_audio_dir", None),
-        )
-        if path:
-            self.audio_file.set(path)
-            self._last_audio_dir = str(Path(path).parent)
-            self._config["last_audio_dir"] = self._last_audio_dir
-            _save_config(self._config)
-
-    def _pick_album_art(self) -> None:
-        path = filedialog.askopenfilename(title="Choose album art", filetypes=_IMAGE_FILETYPES)
-        if path:
-            self.album_art_file.set(path)
-
-    def _pick_out_dir(self) -> None:
-        path = filedialog.askdirectory(
-            title="Choose an output folder", initialdir=getattr(self, "_last_out_dir", None),
-        )
-        if path:
-            self.out_dir_var.set(path)
-            self._last_out_dir = path
-            self._config["last_out_dir"] = path
-            _save_config(self._config)
-            self._update_preview()
-
-    def _pick_moonscraper(self) -> str | None:
-        path = filedialog.askopenfilename(
-            title="Choose Moonscraper Chart Editor.exe",
-            filetypes=_MOONSCRAPER_FILETYPES,
-            initialdir=str(Path(self.moonscraper_exe.get()).parent)
-            if self.moonscraper_exe.get().strip()
-            else None,
-        )
-        if not path:
+    def _first_local_path(self, event) -> str | None:
+        data = event.mimeData()
+        if not data.hasUrls():
             return None
-        self.moonscraper_exe.set(path)
-        self._save_moonscraper_preferences()
-        return path
+        for url in data.urls():
+            if url.isLocalFile():
+                return url.toLocalFile()
+        return None
 
-    def _save_moonscraper_preferences(self) -> None:
-        self._config["moonscraper_exe"] = self.moonscraper_exe.get().strip()
-        self._config["open_in_moonscraper"] = self.open_after_import.get()
+    def _flag(self, active: bool) -> None:
+        self.setProperty("dropTarget", "true" if active else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _accepts(self, path: str) -> bool:
+        if self._kind == "dir":
+            return Path(path).is_dir()
+        return Path(path).suffix.lower() in _ACCEPTED_SUFFIXES[self._kind]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        path = self._first_local_path(event)
+        if path and self._accepts(path):
+            event.acceptProposedAction()
+            self._flag(True)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._flag(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._flag(False)
+        path = self._first_local_path(event)
+        if not path:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.setText(path)
+        self.pathDropped.emit(path)
+
+
+class FileRow(QWidget):
+    """Label + drop-aware path field + Browse button, on one grid row."""
+
+    changed = Signal(str)
+    picked = Signal(str)
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        kind: str,
+        placeholder: str = "",
+        grid: QGridLayout,
+        row: int,
+        directory: bool = False,
+        filetypes: list[tuple[str, str]] | None = None,
+        dialog_title: str = "Choose a file",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._directory = directory
+        self._filetypes = filetypes or []
+        self._dialog_title = dialog_title
+        self.start_dir: str | None = None
+
+        caption = QLabel(label)
+        caption.setObjectName("FieldLabel")
+        caption.setMinimumWidth(104)
+
+        self.edit = DropLineEdit(kind)
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.textChanged.connect(self.changed.emit)
+        self.edit.pathDropped.connect(self.picked.emit)
+
+        button = QPushButton("Browse")
+        button.setObjectName("Browse")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(self._browse)
+
+        grid.addWidget(caption, row, 0)
+        grid.addWidget(self.edit, row, 1)
+        grid.addWidget(button, row, 2)
+
+    def text(self) -> str:
+        return self.edit.text().strip()
+
+    def setText(self, value: str) -> None:  # noqa: N802 - mirrors QLineEdit
+        self.edit.setText(value)
+        # Long paths otherwise sit scrolled to the tail, hiding the drive letter.
+        self.edit.setCursorPosition(0)
+
+    def _browse(self) -> None:
+        start = self.start_dir or ""
+        if self._directory:
+            path = QFileDialog.getExistingDirectory(self, self._dialog_title, start)
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, self._dialog_title, start, qt_filter(self._filetypes),
+            )
+        if path:
+            path = str(Path(path))
+            self.edit.setText(path)
+            self.picked.emit(path)
+
+
+class StatTile(QFrame):
+    """Small inset panel: coloured dot, caption, value, state chip."""
+
+    def __init__(self, caption: str, colour: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Inset")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(13, 11, 13, 12)
+        outer.setSpacing(5)
+
+        head = QHBoxLayout()
+        head.setSpacing(7)
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {colour}; font-size: 11px;")
+        title = QLabel(caption)
+        title.setObjectName("CardTitle")
+        title.setStyleSheet(f"color: {colour};")
+        self.state = chip("waiting", "")
+        head.addWidget(dot)
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self.state)
+        outer.addLayout(head)
+
+        self.value = QLabel("—")
+        self.value.setObjectName("Muted")
+        self.value.setWordWrap(False)
+        self.value.setTextFormat(Qt.TextFormat.PlainText)
+        outer.addWidget(self.value)
+
+    def set_state(self, text: str, kind: str) -> None:
+        self.state.setText(text)
+        self.state.setObjectName("Chip" + kind)
+        self.state.style().unpolish(self.state)
+        self.state.style().polish(self.state)
+
+    def set_value(self, text: str) -> None:
+        metrics = self.value.fontMetrics()
+        self.value.setText(metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, 300))
+        self.value.setToolTip(text)
+
+
+# ------------------------------------------------------------------- worker --
+
+class ConvertWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(object)
+
+    def __init__(self, kwargs: dict) -> None:
+        super().__init__()
+        self._kwargs = kwargs
+
+    def run(self) -> None:
+        try:
+            result = convert_song(on_progress=self.progress.emit, **self._kwargs)
+        except ConvertError as exc:
+            self.progress.emit(f"error: {exc}")
+            self.finished.emit(None)
+        except Exception as exc:  # surface it, don't take the window down
+            self.progress.emit(f"unexpected error: {exc}")
+            self.finished.emit(None)
+        else:
+            self.finished.emit(result.out_dir)
+
+
+# ------------------------------------------------------------------- dialog --
+
+class MeasureTracksDialog(QDialog):
+    """Per-source-measure track overrides for the selected tab."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        tracks: list[tuple[int, str]],
+        measure_count: int,
+        current: dict[int, int],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Tracks by source measure")
+        self.resize(560, 680)
+
+        self._labels: dict[str, int | None] = {"Auto": None}
+        for track_id, name in tracks:
+            self._labels[f"{track_id}: {name}"] = track_id
+        options = list(self._labels)
+        self._measure_count = measure_count
+        self.result_value = ""
+
+        root = QWidget(self)
+        root.setObjectName("Root")
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.addWidget(root)
+
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(12)
+
+        blurb = QLabel(
+            "Source measures match the Guitar Pro tab and exclude the generated "
+            "empty lead-in bars. Auto keeps normal blending."
+        )
+        blurb.setObjectName("Body")
+        blurb.setWordWrap(True)
+        outer.addWidget(blurb)
+
+        bulk = Card("Apply one choice to a range")
+        bulk_row = QHBoxLayout()
+        bulk_row.setSpacing(8)
+        self.range_start = QLineEdit("1")
+        self.range_start.setFixedWidth(64)
+        self.range_end = QLineEdit(str(measure_count))
+        self.range_end.setFixedWidth(64)
+        self.bulk_choice = QComboBox()
+        self.bulk_choice.addItems(options)
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(self._apply_range)
+        for widget in (
+            QLabel("From"), self.range_start, QLabel("through"), self.range_end,
+        ):
+            if isinstance(widget, QLabel):
+                widget.setObjectName("FieldLabel")
+            bulk_row.addWidget(widget)
+        bulk_row.addWidget(self.bulk_choice, 1)
+        bulk_row.addWidget(apply_button)
+        bulk.body.addLayout(bulk_row)
+        outer.addWidget(bulk)
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        rows_host = QWidget()
+        rows = QGridLayout(rows_host)
+        rows.setContentsMargins(2, 2, 2, 2)
+        rows.setColumnStretch(1, 1)
+        rows.setVerticalSpacing(5)
+
+        self._selections: dict[int, QComboBox] = {}
+        for measure in range(1, measure_count + 1):
+            caption = QLabel(f"Measure {measure}")
+            caption.setObjectName("FieldLabel")
+            combo = QComboBox()
+            combo.addItems(options)
+            chosen = next(
+                (label for label, tid in self._labels.items() if tid == current.get(measure)),
+                "Auto",
+            )
+            combo.setCurrentText(chosen)
+            rows.addWidget(caption, measure - 1, 0)
+            rows.addWidget(combo, measure - 1, 1)
+            self._selections[measure] = combo
+        area.setWidget(rows_host)
+        outer.addWidget(area, 1)
+
+        footer = QHBoxLayout()
+        clear = QPushButton("Clear all")
+        clear.setObjectName("Ghost")
+        clear.clicked.connect(self._clear_all)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("Ghost")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Use selections")
+        save.clicked.connect(self._save)
+        footer.addWidget(clear)
+        footer.addStretch(1)
+        footer.addWidget(cancel)
+        footer.addWidget(save)
+        outer.addLayout(footer)
+
+    def _apply_range(self) -> None:
+        try:
+            first = int(self.range_start.text())
+            last = int(self.range_end.text())
+        except ValueError:
+            QMessageBox.critical(self, "Per-measure tracks", "Range endpoints must be whole measure numbers.")
+            return
+        if first < 1 or last < first or last > self._measure_count:
+            QMessageBox.critical(
+                self, "Per-measure tracks", f"Choose a range from 1 through {self._measure_count}.",
+            )
+            return
+        for measure in range(first, last + 1):
+            self._selections[measure].setCurrentText(self.bulk_choice.currentText())
+
+    def _clear_all(self) -> None:
+        for combo in self._selections.values():
+            combo.setCurrentText("Auto")
+
+    def _save(self) -> None:
+        overrides = [
+            f"{measure}:{self._labels[combo.currentText()]}"
+            for measure, combo in self._selections.items()
+            if self._labels[combo.currentText()] is not None
+        ]
+        self.result_value = ",".join(overrides)
+        self.accept()
+
+
+# ---------------------------------------------------------------- main window -
+
+class App(QWidget):
+    _log_line = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("Root")
+        self.setWindowTitle("Tabs2Chart Importer")
+        self.resize(1140, 880)
+        self.setMinimumSize(980, 720)
+
+        self._config = _load_config()
+        self._out_dir: Path | None = None
+        self._thread: QThread | None = None
+        self._worker: ConvertWorker | None = None
+        self._measure_tracks = ""
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(250)
+        self._preview_timer.timeout.connect(self._refresh_summary)
+
+        self._build()
+        self._restore_config()
+        self._refresh_summary()
+
+    # -- construction ---------------------------------------------------------
+
+    def _build(self) -> None:
+        page = QVBoxLayout(self)
+        page.setContentsMargins(20, 20, 20, 18)
+        page.setSpacing(13)
+
+        page.addWidget(self._header())
+        page.addWidget(self._summary_card())
+
+        columns = QHBoxLayout()
+        columns.setSpacing(13)
+        columns.addWidget(self._source_card(), 1)
+        columns.addWidget(self._controls_card(), 1)
+        page.addLayout(columns)
+
+        self.convert_btn = QPushButton("GENERATE CLONE HERO CHART   →")
+        self.convert_btn.setObjectName("Primary")
+        self.convert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.convert_btn.setFont(_tracked_font(14, QFont.Weight.ExtraBold, 0.8))
+        self.convert_btn.clicked.connect(self._on_convert)
+        page.addWidget(self.convert_btn)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)  # only shown while a conversion runs
+        page.addWidget(self.progress)
+
+        page.addWidget(self._activity_card(), 1)
+        page.addLayout(self._footer())
+
+        self._log_line.connect(self._log)
+
+    def _header(self) -> QWidget:
+        card = QFrame()
+        card.setObjectName("HeaderCard")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(20, 16, 20, 16)
+        row.setSpacing(15)
+
+        mark = QLabel("T2C")
+        mark.setObjectName("Wordmark")
+        mark.setFixedSize(50, 50)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(mark)
+
+        copy = QVBoxLayout()
+        copy.setSpacing(2)
+        title = QLabel("TAB → CHART")
+        title.setObjectName("Display")
+        title.setFont(_tracked_font(21, QFont.Weight.Bold, 0.6))
+        subtitle = QLabel("Guitar Pro in.  Playable Clone Hero chart out.")
+        subtitle.setObjectName("Body")
+        copy.addWidget(title)
+        copy.addWidget(subtitle)
+        row.addLayout(copy)
+        row.addStretch(1)
+
+        stages = chip("01  SOURCE   ·   02  MAP   ·   03  PLAY", "Cyan")
+        stages.setFont(_tracked_font(11, QFont.Weight.DemiBold, 0.6))
+        row.addWidget(chip("IMPORT WORKSPACE"))
+        row.addWidget(stages)
+        return card
+
+    def _summary_card(self) -> QWidget:
+        self.summary_chips = QWidget()
+        chip_row = QHBoxLayout(self.summary_chips)
+        chip_row.setContentsMargins(0, 0, 0, 0)
+        chip_row.setSpacing(6)
+        self.chip_tab = chip("tab", "")
+        self.chip_audio = chip("audio", "")
+        self.chip_art = chip("art", "")
+        for widget in (self.chip_tab, self.chip_audio, self.chip_art):
+            chip_row.addWidget(widget)
+
+        card = Card("Import summary", accent=True, header_extra=self.summary_chips)
+
+        self.song_label = QLabel("No tab selected")
+        self.song_label.setObjectName("Display")
+        self.song_label.setFont(_tracked_font(21, QFont.Weight.Bold, 0.2))
+        card.body.addWidget(self.song_label)
+
+        self.destination_label = QLabel("Choose a tab to preview the imported song.")
+        self.destination_label.setObjectName("Mono")
+        self.destination_label.setWordWrap(True)
+        card.body.addWidget(self.destination_label)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.tile_tab = StatTile("Guitar Pro tab", qt_theme.CYAN)
+        self.tile_audio = StatTile("Song audio", qt_theme.GREEN)
+        tiles.addWidget(self.tile_tab)
+        tiles.addWidget(self.tile_audio)
+        card.body.addLayout(tiles)
+        return card
+
+    def _source_card(self) -> QWidget:
+        card = Card("Source material")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(1, 1)
+
+        self.row_tab = FileRow(
+            "Guitar Pro tab", kind="gp", grid=grid, row=0,
+            placeholder="Drop a .gp / .gpx / .gp3-5 file here",
+            filetypes=_GP_FILETYPES, dialog_title="Choose a Guitar Pro tab",
+        )
+        self.row_audio = FileRow(
+            "Song audio", kind="audio", grid=grid, row=1,
+            placeholder="Drop the matching recording here",
+            filetypes=_AUDIO_FILETYPES, dialog_title="Choose an audio file",
+        )
+        self.row_art = FileRow(
+            "Album art", kind="image", grid=grid, row=2,
+            placeholder="Optional cover image",
+            filetypes=_IMAGE_FILETYPES, dialog_title="Choose album art",
+        )
+        self.row_songs = FileRow(
+            "Clone Hero folder", kind="dir", grid=grid, row=3,
+            placeholder="Your Clone Hero Songs directory",
+            directory=True, dialog_title="Choose your Songs folder",
+        )
+        card.body.addLayout(grid)
+
+        self.row_tab.changed.connect(lambda _t: self._preview_timer.start())
+        self.row_tab.picked.connect(self._on_tab_picked)
+        self.row_audio.changed.connect(lambda _t: self._preview_timer.start())
+        self.row_audio.picked.connect(lambda p: self._remember("last_audio_dir", p))
+        self.row_art.changed.connect(lambda _t: self._preview_timer.start())
+        self.row_songs.changed.connect(lambda _t: self._preview_timer.start())
+        self.row_songs.picked.connect(lambda p: self._remember("last_out_dir", p, directory=True))
+
+        hint = QLabel("Drag files straight onto a field, or use Browse.")
+        hint.setObjectName("Muted")
+        card.body.addWidget(hint)
+        card.body.addStretch(1)
+        return card
+
+    def _controls_card(self) -> QWidget:
+        card = Card("Chart controls")
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self._mapping_tab(), "Mapping")
+        tabs.addTab(self._sync_tab(), "Sync")
+        tabs.addTab(self._moonscraper_tab(), "MoonScraper")
+        card.body.addWidget(tabs)
+        return card
+
+    def _mapping_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(1, 1)
+
+        single = QLabel("Single track")
+        single.setObjectName("FieldLabel")
+        self.track_edit = QLineEdit()
+        self.track_edit.setPlaceholderText("auto")
+        self.track_edit.setFixedWidth(90)
+        grid.addWidget(single, 0, 0)
+        grid.addWidget(self.track_edit, 0, 1, Qt.AlignmentFlag.AlignLeft)
+
+        blend = QLabel("Tracks to blend")
+        blend.setObjectName("FieldLabel")
+        self.tracks_edit = QLineEdit()
+        self.tracks_edit.setPlaceholderText("e.g. 1,0")
+        self.tracks_edit.setFixedWidth(130)
+        grid.addWidget(blend, 1, 0)
+        grid.addWidget(self.tracks_edit, 1, 1, Qt.AlignmentFlag.AlignLeft)
+
+        per_measure = QLabel("Per-measure tracks")
+        per_measure.setObjectName("FieldLabel")
+        configure = QPushButton("Configure…")
+        configure.setObjectName("Browse")
+        configure.clicked.connect(self._edit_measure_tracks)
+        self.measure_summary = QLabel("Auto for every measure")
+        self.measure_summary.setObjectName("Muted")
+        measure_row = QHBoxLayout()
+        measure_row.setSpacing(9)
+        measure_row.addWidget(configure)
+        measure_row.addWidget(self.measure_summary, 1)
+        grid.addWidget(per_measure, 2, 0)
+        grid.addLayout(measure_row, 2, 1)
+        layout.addLayout(grid)
+
+        self.star_power = QCheckBox("Generate automatic Star Power")
+        self.star_power.setChecked(True)
+        layout.addWidget(self.star_power)
+        layout.addStretch(1)
+        return page
+
+    def _sync_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(10)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        caption = QLabel("Audio offset")
+        caption.setObjectName("FieldLabel")
+        self.offset_edit = QLineEdit("0")
+        self.offset_edit.setFixedWidth(90)
+        unit = QLabel("ms")
+        unit.setObjectName("Muted")
+        row.addWidget(caption)
+        row.addWidget(self.offset_edit)
+        row.addWidget(unit)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        note = QLabel(
+            "Positive values push the chart later against the recording. Every "
+            "import already includes two empty lead-in measures."
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        return page
+
+    def _moonscraper_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setColumnStretch(1, 1)
+        self.row_moonscraper = FileRow(
+            "Executable", kind="exe", grid=grid, row=0,
+            placeholder="Moonscraper Chart Editor.exe",
+            filetypes=_MOONSCRAPER_FILETYPES, dialog_title="Choose Moonscraper Chart Editor.exe",
+        )
+        self.row_moonscraper.picked.connect(lambda _p: self._save_moonscraper_preferences())
+        layout.addLayout(grid)
+
+        self.open_after_import = QCheckBox("Open the generated chart after import")
+        self.open_after_import.toggled.connect(lambda _v: self._save_moonscraper_preferences())
+        layout.addWidget(self.open_after_import)
+        layout.addStretch(1)
+        return page
+
+    def _activity_card(self) -> QWidget:
+        card = Card("Activity")
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("Log")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMinimumHeight(120)
+        self.log_view.setPlaceholderText("Conversion output appears here.")
+        card.body.addWidget(self.log_view)
+        return card
+
+    def _footer(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(9)
+        reload_btn = QPushButton("Reload a previous import…")
+        reload_btn.setObjectName("Ghost")
+        reload_btn.clicked.connect(self._reload_generated_import)
+        self.open_folder_btn = QPushButton("Open output folder")
+        self.open_folder_btn.setObjectName("Ghost")
+        self.open_folder_btn.setEnabled(False)
+        self.open_folder_btn.clicked.connect(self._open_output_folder)
+        self.open_moonscraper_btn = QPushButton("Open in MoonScraper")
+        self.open_moonscraper_btn.setEnabled(False)
+        self.open_moonscraper_btn.clicked.connect(lambda: self._open_in_moonscraper())
+        row.addWidget(reload_btn)
+        row.addStretch(1)
+        row.addWidget(self.open_folder_btn)
+        row.addWidget(self.open_moonscraper_btn)
+        return row
+
+    # -- config ---------------------------------------------------------------
+
+    def _restore_config(self) -> None:
+        self.row_tab.start_dir = self._config.get("last_gp_dir")
+        self.row_audio.start_dir = self._config.get("last_audio_dir")
+        out_dir = self._config.get("last_out_dir") or str(Path.cwd() / "songs")
+        self.row_songs.start_dir = out_dir
+        self.row_songs.setText(out_dir)
+
+        discovered = find_moonscraper(self._config.get("moonscraper_exe"))
+        if discovered:
+            self.row_moonscraper.setText(str(discovered))
+        self.open_after_import.setChecked(bool(self._config.get("open_in_moonscraper", True)))
+
+    def _remember(self, key: str, path: str, *, directory: bool = False) -> None:
+        value = path if directory else str(Path(path).parent)
+        self._config[key] = value
         _save_config(self._config)
 
-    def _log(self, line: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", line + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    def _save_moonscraper_preferences(self) -> None:
+        self._config["moonscraper_exe"] = self.row_moonscraper.text()
+        self._config["open_in_moonscraper"] = self.open_after_import.isChecked()
+        _save_config(self._config)
 
-    def _poll_log_queue(self) -> None:
+    # -- summary --------------------------------------------------------------
+
+    def _on_tab_picked(self, path: str) -> None:
+        self._remember("last_gp_dir", path)
+        audio, art = _suggest_companion_files(path)
+        if audio is not None and not self.row_audio.text():
+            self.row_audio.setText(str(audio))
+            self._log(f"Matched song audio: {audio.name}")
+        if art is not None and not self.row_art.text():
+            self.row_art.setText(str(art))
+            self._log(f"Matched album art: {art.name}")
+        self._refresh_summary()
+
+    def _refresh_summary(self) -> None:
+        tab = self.row_tab.text()
+        audio = self.row_audio.text()
+        art = self.row_art.text()
+
+        tab_ok = bool(tab) and Path(tab).is_file()
+        audio_ok = bool(audio) and Path(audio).is_file()
+        art_ok = bool(art) and Path(art).is_file()
+
+        self._set_chip(self.chip_tab, "tab", tab_ok, bool(tab))
+        self._set_chip(self.chip_audio, "audio", audio_ok, bool(audio))
+        self._set_chip(self.chip_art, "art", art_ok, bool(art), optional=True)
+
+        self.tile_tab.set_value(Path(tab).name if tab else "no tab selected")
+        self.tile_tab.set_state(*self._tile_state(tab, tab_ok))
+        self.tile_audio.set_value(Path(audio).name if audio else "chart only, no playback")
+        self.tile_audio.set_state(*self._tile_state(audio, audio_ok, optional=True))
+
+        if not tab_ok:
+            self.song_label.setText("No tab selected")
+            self.destination_label.setText("Choose a tab to preview the imported song.")
+            self.convert_btn.setEnabled(not self._busy())
+            return
+
         try:
-            while True:
-                self._log(self._log_queue.get_nowait())
-        except queue.Empty:
-            pass
-        self.after(100, self._poll_log_queue)
+            artist, title = peek_metadata(tab)
+        except Exception as exc:
+            self.song_label.setText("Could not read this tab")
+            self.destination_label.setText(str(exc))
+            return
+
+        self.song_label.setText(f"{artist} — {title}")
+        root = self.row_songs.text() or str(Path.cwd() / "songs")
+        self.destination_label.setText(str(_song_output_dir(root, artist, title)))
+
+    @staticmethod
+    def _set_chip(widget: QLabel, name: str, ok: bool, filled: bool, *, optional: bool = False) -> None:
+        # Green when resolved, amber only when a path was given but is bad,
+        # neutral when simply not filled in yet.
+        kind = "Green" if ok else "Amber" if filled else ""
+        widget.setText(f"{name}?" if filled and not ok else name)
+        widget.setObjectName("Chip" + kind)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    @staticmethod
+    def _tile_state(value: str, ok: bool, *, optional: bool = False) -> tuple[str, str]:
+        if ok:
+            return "ready", "Green"
+        if value:
+            return "not found", "Amber"
+        return ("optional", "") if optional else ("required", "")
+
+    def _busy(self) -> bool:
+        return self._thread is not None and self._thread.isRunning()
+
+    # -- log ------------------------------------------------------------------
+
+    def _log(self, line: str) -> None:
+        self.log_view.appendPlainText(line)
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+
+    # -- actions --------------------------------------------------------------
+
+    def _edit_measure_tracks(self) -> None:
+        tab = self.row_tab.text()
+        if not tab or not Path(tab).is_file():
+            QMessageBox.critical(self, "Per-measure tracks", "Choose a Guitar Pro tab first.")
+            return
+        try:
+            tracks, measure_count = get_source_measure_info(tab)
+        except Exception as exc:
+            QMessageBox.critical(self, "Per-measure tracks", f"Could not read the tab tracks:\n{exc}")
+            return
+
+        current: dict[int, int] = {}
+        for pair in self._measure_tracks.split(","):
+            if not pair.strip():
+                continue
+            try:
+                measure, track = pair.split(":", 1)
+                current[int(measure)] = int(track)
+            except ValueError:
+                continue
+
+        dialog = MeasureTracksDialog(self, tracks, measure_count, current)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._measure_tracks = dialog.result_value
+            count = len([p for p in self._measure_tracks.split(",") if p])
+            self.measure_summary.setText(
+                f"{count} measure override{'s' if count != 1 else ''}" if count
+                else "Auto for every measure"
+            )
+
+    def _reload_generated_import(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "Choose a generated Tabs2Chart song folder", self.row_songs.text(),
+        )
+        if not selected:
+            return
+        try:
+            settings = integration.read_import_settings(selected)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Reload generated import", str(exc))
+            return
+        inputs = settings["inputs"]
+        advanced = settings.get("advanced", {})
+        self.row_tab.setText(inputs.get("gp_file") or "")
+        self.row_audio.setText(inputs.get("audio") or "")
+        self.row_art.setText(inputs.get("album_art") or "")
+        self.row_songs.setText(inputs.get("output_root") or str(Path(selected).parent))
+        self.track_edit.setText("" if advanced.get("track") is None else str(advanced["track"]))
+        self.tracks_edit.setText(advanced.get("tracks") or "")
+        self._measure_tracks = advanced.get("measure_tracks") or ""
+        self.offset_edit.setText(str(advanced.get("offset_ms", 0)))
+        self.star_power.setChecked(bool(advanced.get("star_power", True)))
+        self._out_dir = Path(selected)
+        self.open_folder_btn.setEnabled(True)
+        self.open_moonscraper_btn.setEnabled(True)
+        self._refresh_summary()
+        self._log(f"Reloaded source and chart settings from {selected}")
 
     def _open_output_folder(self) -> None:
         if self._out_dir and self._out_dir.exists():
-            os.startfile(self._out_dir)  # noqa: S606 - Windows-only, user-chosen local path
+            if hasattr(os, "startfile"):
+                os.startfile(self._out_dir)  # noqa: S606 - Windows, user-chosen local path
+            else:
+                from PySide6.QtCore import QUrl  # noqa: PLC0415
+                from PySide6.QtGui import QDesktopServices  # noqa: PLC0415
+
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._out_dir)))
 
     def _open_in_moonscraper(self, *, prompt_if_missing: bool = True) -> bool:
         if self._out_dir is None:
             return False
-        chart_path = self._out_dir / "notes.chart"
-        executable = find_moonscraper(self.moonscraper_exe.get().strip())
+        executable = find_moonscraper(self.row_moonscraper.text())
         if executable is None and prompt_if_missing:
-            selected = self._pick_moonscraper()
-            executable = find_moonscraper(selected)
+            picked, _ = QFileDialog.getOpenFileName(
+                self, "Choose Moonscraper Chart Editor.exe", "",
+                qt_filter(_MOONSCRAPER_FILETYPES),
+            )
+            if picked:
+                self.row_moonscraper.setText(picked)
+            executable = find_moonscraper(picked or None)
         if executable is None:
-            self._log("MoonScraper was not opened: choose its executable under Advanced.")
+            self._log("MoonScraper was not opened: set its executable on the MoonScraper tab.")
             return False
 
-        self.moonscraper_exe.set(str(executable))
+        self.row_moonscraper.setText(str(executable))
         self._save_moonscraper_preferences()
         try:
             open_chart(
-                chart_path,
+                self._out_dir / "notes.chart",
                 executable,
                 manifest_path=self._out_dir / "moon-scraper-manifest.json",
             )
         except MoonscraperLaunchError as exc:
             self._log(f"MoonScraper was not opened: {exc}")
-            messagebox.showwarning("MoonScraper", str(exc))
+            QMessageBox.warning(self, "MoonScraper", str(exc))
             return False
         self._log(f"Opened notes.chart in MoonScraper: {executable}")
         return True
 
+    # -- conversion -----------------------------------------------------------
+
     def _on_convert(self) -> None:
-        if self._converting:
+        if self._busy():
             return
-        gp_file = self.gp_file.get().strip()
-        if not gp_file:
-            messagebox.showerror("Tabs2Chart", "Choose a Guitar Pro tab first.")
+        tab = self.row_tab.text()
+        if not tab:
+            QMessageBox.critical(self, "Tabs2Chart", "Choose a Guitar Pro tab first.")
             return
-        if Path(gp_file).suffix.lower() not in _GP_SUFFIXES:
-            messagebox.showerror("Tabs2Chart", "Choose a .gp, .gpx, .gp3, .gp4, or .gp5 tab.")
+        if Path(tab).suffix.lower() not in _GP_SUFFIXES:
+            QMessageBox.critical(self, "Tabs2Chart", "Choose a .gp, .gpx, .gp3, .gp4, or .gp5 tab.")
             return
-        audio = self.audio_file.get().strip()
+
+        audio = self.row_audio.text()
         if not audio:
-            if not messagebox.askyesno(
-                "Import without audio?",
-                "No song audio is selected. The chart will be created, but Clone Hero cannot play it "
-                "until you add song.ogg.\n\nContinue anyway?",
-            ):
+            proceed = QMessageBox.question(
+                self, "Import without audio?",
+                "No song audio is selected. The chart will be created, but Clone Hero cannot "
+                "play it until you add song.ogg.\n\nContinue anyway?",
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
                 return
         elif not Path(audio).is_file():
-            messagebox.showerror("Tabs2Chart", f"Song audio does not exist:\n{audio}")
+            QMessageBox.critical(self, "Tabs2Chart", f"Song audio does not exist:\n{audio}")
             return
 
-        def parse_int(var: tk.StringVar, default: int) -> int:
-            text = var.get().strip()
-            return int(text) if text else default
-
         try:
-            offset_ms = parse_int(self.offset_ms, 0)
-            track = int(self.track.get().strip()) if self.track.get().strip() else None
+            offset_ms = int(self.offset_edit.text().strip() or "0")
+            track = int(self.track_edit.text().strip()) if self.track_edit.text().strip() else None
         except ValueError:
-            messagebox.showerror("Tabs2Chart", "Track and audio offset must be whole numbers.")
+            QMessageBox.critical(self, "Tabs2Chart", "Track and audio offset must be whole numbers.")
+            return
+        if track is not None and self._measure_tracks.strip():
+            QMessageBox.critical(
+                self, "Tabs2Chart",
+                "A single verbatim track cannot be combined with per-measure track choices.",
+            )
             return
 
         try:
-            artist, title = peek_metadata(gp_file)
+            artist, title = peek_metadata(tab)
         except Exception as exc:
-            messagebox.showerror("Tabs2Chart", f"Could not read the tab:\n{exc}")
+            QMessageBox.critical(self, "Tabs2Chart", f"Could not read the tab:\n{exc}")
             return
-        root = self.out_dir_var.get().strip() or str(Path.cwd() / "songs")
+
+        root = self.row_songs.text() or str(Path.cwd() / "songs")
         out_dir = _song_output_dir(root, artist, title)
         if out_dir.exists() and any(out_dir.iterdir()):
-            if not messagebox.askyesno(
-                "Replace existing import?",
+            proceed = QMessageBox.question(
+                self, "Replace existing import?",
                 f"This song folder already contains files:\n{out_dir}\n\n"
                 "Replace the generated chart files and keep any other files?",
-            ):
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
                 return
 
         kwargs = dict(
-            gp_file=gp_file,
+            gp_file=tab,
             out=out_dir,
             audio=audio or None,
-            album_art=self.album_art_file.get().strip() or None,
+            album_art=self.row_art.text() or None,
             track=track,
-            tracks=self.tracks.get().strip() or None,
+            tracks=self.tracks_edit.text().strip() or None,
+            measure_tracks=self._measure_tracks.strip() or None,
+            star_power=self.star_power.isChecked(),
             offset_ms=offset_ms,
         )
 
-        self._converting = True
-        self.convert_btn.configure(state="disabled", text="Importing...")
-        self.open_folder_btn.configure(state="disabled")
-        self.open_moonscraper_btn.configure(state="disabled")
-        self.progress.start(12)
+        self.log_view.clear()
+        self.convert_btn.setEnabled(False)
+        self.convert_btn.setText("IMPORTING…")
+        self.open_folder_btn.setEnabled(False)
+        self.open_moonscraper_btn.setEnabled(False)
+        self.progress.setVisible(True)
         self._out_dir = None
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
 
-        thread = threading.Thread(target=self._run_convert, kwargs=kwargs, daemon=True)
-        thread.start()
+        self._thread = QThread(self)
+        self._worker = ConvertWorker(kwargs)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._log_line.emit)
+        self._worker.finished.connect(self._on_convert_done)
+        self._thread.start()
 
-    def _run_convert(self, **kwargs) -> None:
-        try:
-            result = convert_song(on_progress=self._log_queue.put, **kwargs)
-        except ConvertError as e:
-            self._log_queue.put(f"error: {e}")
-            self.after(0, self._on_convert_done, None)
-        except Exception as e:  # unexpected failure - surface it, don't crash the window
-            self._log_queue.put(f"unexpected error: {e}")
-            self.after(0, self._on_convert_done, None)
-        else:
-            self.after(0, self._on_convert_done, result.out_dir)
+    def _on_convert_done(self, out_dir: object) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(3000)
+            self._thread = None
+        self._worker = None
 
-    def _on_convert_done(self, out_dir: Path | None) -> None:
-        self._converting = False
-        self.progress.stop()
-        self.convert_btn.configure(state="normal", text="Import tab + song")
-        if out_dir is not None:
-            self._out_dir = out_dir
-            self.open_folder_btn.configure(state="normal")
-            self.open_moonscraper_btn.configure(state="normal")
-            opened = False
-            if self.open_after_import.get():
-                opened = self._open_in_moonscraper()
-            messagebox.showinfo(
-                "Import complete",
-                f"Clone Hero song created successfully:\n\n{out_dir}\n\n"
-                + (
-                    "The generated chart is now open in MoonScraper."
-                    if opened
-                    else "Use Open in MoonScraper to review it, then scan songs in Clone Hero."
-                ),
+        self.progress.setVisible(False)
+        self.convert_btn.setEnabled(True)
+        self.convert_btn.setText("GENERATE CLONE HERO CHART   →")
+
+        if out_dir is None:
+            QMessageBox.critical(
+                self, "Import failed",
+                "The import did not finish. See the activity log for the exact error.",
             )
-        else:
-            messagebox.showerror(
-                "Import failed",
-                "The import did not finish. See the progress log for the exact error.",
-            )
+            return
+
+        self._out_dir = Path(out_dir)
+        self.open_folder_btn.setEnabled(True)
+        self.open_moonscraper_btn.setEnabled(True)
+        opened = self._open_in_moonscraper() if self.open_after_import.isChecked() else False
+        QMessageBox.information(
+            self, "Import complete",
+            f"Clone Hero song created successfully:\n\n{self._out_dir}\n\n"
+            + (
+                "The generated chart is now open in MoonScraper."
+                if opened
+                else "Use Open in MoonScraper to review it, then scan songs in Clone Hero."
+            ),
+        )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
+        super().closeEvent(event)
 
 
 def main() -> int:
-    app = App()
-    app.mainloop()
-    return 0
+    QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
+    app = QApplication(sys.argv)
+    app.setApplicationName("Tabs2Chart")
+    qt_theme.apply(app)
+    window = App()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":

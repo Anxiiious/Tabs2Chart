@@ -201,3 +201,12 @@ def test_convert_section_resets_contour(tmp_path):
     assert rc == 0
     chart = (out / "notes.chart").read_text(encoding="utf-8")
     assert "[ExpertSingle]" in chart
+
+
+def test_measure_tracks_parser_uses_one_based_source_measures():
+    assert cli._parse_measure_tracks("5:2, 6:1") == {4: 2, 5: 1}
+
+
+def test_measure_tracks_parser_rejects_bad_syntax():
+    with pytest.raises(cli.ConvertError, match="measure:track"):
+        cli._parse_measure_tracks("5=2")

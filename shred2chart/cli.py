@@ -200,6 +200,43 @@ def _guess_guitar_tracks(tracks: list[tuple[int, str]]) -> list[int]:
     return chosen or [tracks[0][0]]
 
 
+def get_source_measure_info(gp_file: str | Path) -> tuple[list[tuple[int, str]], int]:
+    """Return the tab's track list and one-indexed-source measure count.
+
+    The GUI uses this for per-measure overrides. These are source measures,
+    before generated lead-in bars and before any repeat playback expansion.
+    """
+    path = Path(gp_file)
+    if path.suffix.lower() in _CONTAINER_SUFFIXES:
+        xml_text = gpx_reader.extract_gpif(path)
+        root = ET.fromstring(xml_text)
+        tracks = ir_gpif.list_tracks(xml_text)
+        return tracks, len(root.findall("./MasterBars/MasterBar"))
+    import guitarpro  # noqa: PLC0415
+    song = guitarpro.parse(str(path))
+    return ir_gp.list_tracks(path), len(song.measureHeaders)
+
+
+def _parse_measure_tracks(value: str | None) -> dict[int, int]:
+    """Parse ``source_measure:track`` pairs into zero-based measure keys."""
+    if not value:
+        return {}
+    overrides: dict[int, int] = {}
+    for item in value.split(","):
+        try:
+            measure_text, track_text = item.split(":", 1)
+            measure = int(measure_text.strip())
+            track = int(track_text.strip())
+        except ValueError as exc:
+            raise ConvertError(
+                "measure tracks must use source-measure:track pairs, e.g. '5:2,6:1'"
+            ) from exc
+        if measure < 1:
+            raise ConvertError("measure track overrides use 1-based source measure numbers")
+        overrides[measure - 1] = track
+    return overrides
+
+
 def _safe_path_part(value: str) -> str:
     """Keep metadata-derived output paths within the songs directory."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f]', "_", value).strip(" .")
@@ -367,6 +404,8 @@ def convert_song(
     album_art: str | Path | None = None,
     track: int | None = None,
     tracks: str | None = None,
+    measure_tracks: str | None = None,
+    star_power: bool = True,
     lead_in_bars: int = chart_writer.DEFAULT_LEAD_IN_BARS,
     offset_ms: int = 0,
     charter: str = "",
@@ -419,6 +458,10 @@ def convert_song(
         track_list = ir_gp.list_tracks(path)
 
     known = {t for t, _ in track_list}
+    measure_overrides = _parse_measure_tracks(measure_tracks)
+    unknown_overrides = sorted(set(measure_overrides.values()) - known)
+    if unknown_overrides:
+        raise ConvertError(f"override track(s) {unknown_overrides} not in this file")
     if tracks:
         try:
             track_ids = [int(t) for t in tracks.split(",")]
@@ -433,6 +476,9 @@ def convert_song(
         track_ids = [track]
     else:
         track_ids = _guess_guitar_tracks(track_list)
+
+    if track is not None and measure_overrides:
+        raise ConvertError("per-measure track overrides cannot be used with verbatim --track")
 
     names = dict(track_list)
     _info(f"{title} - {artist}")
@@ -449,9 +495,20 @@ def convert_song(
         sections = []
 
     if is_container and xml_text is not None:
-        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+        bar_starts, _, bar_source_index = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
     else:
         bar_starts = _estimate_bar_starts(tempo_events)
+        bar_source_index = list(range(len(bar_starts)))
+
+    unknown_measures = sorted(set(measure_overrides) - set(bar_source_index))
+    if unknown_measures:
+        displayed = [measure + 1 for measure in unknown_measures]
+        raise ConvertError(f"source measure override(s) {displayed} not in this file")
+    bar_track_overrides = {
+        bar_start: measure_overrides[source_measure]
+        for bar_start, source_measure in zip(bar_starts, bar_source_index)
+        if source_measure in measure_overrides
+    }
 
     blend_spans = sections
     if not blend_spans and len(track_ids) > 1:
@@ -463,28 +520,42 @@ def convert_song(
 
     try:
         if is_container and xml_text is not None:
-            tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
+            loaded_track_ids = list(dict.fromkeys([*track_ids, *measure_overrides.values()]))
+            tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in loaded_track_ids}
         else:
-            tracks_notes = {t: ir_gp.dump_ir(path, track_index=t) for t in track_ids}
+            loaded_track_ids = list(dict.fromkeys([*track_ids, *measure_overrides.values()]))
+            tracks_notes = {t: ir_gp.dump_ir(path, track_index=t) for t in loaded_track_ids}
     except (gpx_reader.GpxFormatError, gpif_tempo.GpifFormatError, ValueError) as e:
         raise ConvertError(str(e)) from e
     except Exception as e:
         raise ConvertError(f"error parsing notes from {path}: {e}") from e
 
-    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans, bar_starts)
+    blended, choices = blend.blend_tracks(
+        tracks_notes, track_ids, blend_spans, bar_starts, bar_track_overrides,
+    )
     section_ticks = [s["tick"] for s in sections]
-    chart_notes = mapper.map_notes(blended, section_ticks=section_ticks)
+    chart_notes = mapper.map_notes(
+        blended, section_ticks=section_ticks, bar_ticks=bar_starts,
+    )
+    star_power_phrases = (
+        chart_writer.auto_star_power_phrases(chart_notes, bar_starts, sections)
+        if star_power else []
+    )
 
     _info(f"{len(sections)} section(s), {len(blended)} notes after blending, {len(chart_notes)} chart events")
     for choice in choices:
         _info(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
+    unshifted_chart_notes = chart_notes
     tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
         tempo_events,
         sections,
         chart_notes,
         bars=lead_in_bars,
     )
+    if star_power_phrases and chart_notes:
+        chart_shift = chart_notes[0].tick - unshifted_chart_notes[0].tick
+        star_power_phrases = [(tick + chart_shift, duration) for tick, duration in star_power_phrases]
     effective_offset_ms = offset_ms - lead_in_ms
     if lead_in_ms:
         _info(f"added {lead_in_bars} empty lead-in bars before the chart")
@@ -493,6 +564,7 @@ def convert_song(
 
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes,
+        star_power_phrases=star_power_phrases,
         offset_ms=effective_offset_ms, charter=resolved_charter,
     )
 
@@ -524,6 +596,21 @@ def convert_song(
         out_dir, title, artist, tempo_events, sections, len(chart_notes),
         offset_ms=effective_offset_ms, audio_path=audio_source,
     )
+    integration.write_import_settings(out_dir, {
+        "inputs": {
+            "gp_file": str(path.resolve()),
+            "audio": str(Path(audio).resolve()) if audio else None,
+            "album_art": str(Path(album_art).resolve()) if album_art else None,
+            "output_root": str(out_dir.parent.resolve()),
+        },
+        "advanced": {
+            "track": track,
+            "tracks": tracks,
+            "measure_tracks": measure_tracks,
+            "offset_ms": offset_ms,
+            "star_power": star_power,
+        },
+    })
 
     if archive:
         _write_archive(out_dir, artist, title)
@@ -603,6 +690,17 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     else:
         track_ids = _guess_guitar_tracks(tracks)
 
+    try:
+        measure_overrides = _parse_measure_tracks(args.measure_tracks)
+    except ConvertError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    known = {track_id for track_id, _ in tracks}
+    unknown_overrides = sorted(set(measure_overrides.values()) - known)
+    if unknown_overrides:
+        print(f"error: override track(s) {unknown_overrides} not in this file", file=sys.stderr)
+        return 1
+
     names = dict(tracks)
     if args.interactive:
         interactive_options = _prompt_convert_options(args, tracks, track_ids, names, artist, title)
@@ -628,10 +726,24 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         sections = []
 
     if is_container and xml_text is not None:
-        bar_starts, _, _ = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
+        bar_starts, _, bar_source_index = gpif_tempo.compute_bar_grid(ET.fromstring(xml_text))
     else:
         # Estimate bar grid from tempo events for legacy files
         bar_starts = _estimate_bar_starts(tempo_events)
+        bar_source_index = list(range(len(bar_starts)))
+
+    unknown_measures = sorted(set(measure_overrides) - set(bar_source_index))
+    if unknown_measures:
+        print(
+            f"error: source measure override(s) {[measure + 1 for measure in unknown_measures]} not in this file",
+            file=sys.stderr,
+        )
+        return 1
+    bar_track_overrides = {
+        bar_start: measure_overrides[source_measure]
+        for bar_start, source_measure in zip(bar_starts, bar_source_index)
+        if source_measure in measure_overrides
+    }
 
     # Blend at section granularity; fall back to 8-bar windows for files
     # with no section markers.
@@ -645,10 +757,11 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     # Per-track note extraction
     try:
+        loaded_track_ids = list(dict.fromkeys([*track_ids, *measure_overrides.values()]))
         if is_container and xml_text is not None:
-            tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in track_ids}
+            tracks_notes = {t: ir_gpif.dump_ir(xml_text, track_index=t) for t in loaded_track_ids}
         else:
-            tracks_notes = {t: ir_gp.dump_ir(path, track_index=t) for t in track_ids}
+            tracks_notes = {t: ir_gp.dump_ir(path, track_index=t) for t in loaded_track_ids}
     except (gpx_reader.GpxFormatError, gpif_tempo.GpifFormatError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -656,9 +769,17 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         print(f"error parsing notes from {path}: {e}", file=sys.stderr)
         return 1
 
-    blended, choices = blend.blend_tracks(tracks_notes, track_ids, blend_spans, bar_starts)
+    blended, choices = blend.blend_tracks(
+        tracks_notes, track_ids, blend_spans, bar_starts, bar_track_overrides,
+    )
     section_ticks = [s["tick"] for s in sections]
-    chart_notes = mapper.map_notes(blended, section_ticks=section_ticks)
+    chart_notes = mapper.map_notes(
+        blended, section_ticks=section_ticks, bar_ticks=bar_starts,
+    )
+    star_power_phrases = (
+        chart_writer.auto_star_power_phrases(chart_notes, bar_starts, sections)
+        if not args.no_star_power else []
+    )
 
     _info(
         f"\n{len(sections)} section(s), {len(blended)} notes after blending, "
@@ -668,12 +789,16 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         for choice in choices:
             print(f"  {choice['section']:<24} <- track {choice['track']} ({names[choice['track']]})")
 
+    unshifted_chart_notes = chart_notes
     tempo_events, sections, chart_notes, lead_in_ms = chart_writer.add_lead_in(
         tempo_events,
         sections,
         chart_notes,
         bars=args.lead_in_bars,
     )
+    if star_power_phrases and chart_notes:
+        chart_shift = chart_notes[0].tick - unshifted_chart_notes[0].tick
+        star_power_phrases = [(tick + chart_shift, duration) for tick, duration in star_power_phrases]
     effective_offset_ms = args.offset_ms - lead_in_ms
     if lead_in_ms:
         _info(f"added {args.lead_in_bars} empty lead-in bars before the chart")
@@ -698,6 +823,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
     chart_writer.write_song_folder(
         out_dir, title, artist, tempo_events, sections, chart_notes,
+        star_power_phrases=star_power_phrases,
         offset_ms=effective_offset_ms, charter=charter,
     )
     audio_source = None
@@ -722,6 +848,21 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         out_dir, title, artist, tempo_events, sections, len(chart_notes),
         offset_ms=effective_offset_ms, audio_path=audio_source,
     )
+    integration.write_import_settings(out_dir, {
+        "inputs": {
+            "gp_file": str(path.resolve()),
+            "audio": str(Path(args.audio).resolve()) if args.audio else None,
+            "album_art": None,
+            "output_root": str(out_dir.parent.resolve()),
+        },
+        "advanced": {
+            "track": getattr(args, "track", None),
+            "tracks": args.tracks,
+            "measure_tracks": args.measure_tracks,
+            "offset_ms": args.offset_ms,
+            "star_power": not args.no_star_power,
+        },
+    })
 
     if getattr(args, "archive", False):
         _write_archive(out_dir, artist, title)
@@ -960,6 +1101,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated track numbers to blend, in priority order (see `list-tracks`); "
         "default: every guitar-named track, blended per section",
     )
+    p_convert.add_argument(
+        "--measure-tracks",
+        help="force source-measure track selections as measure:track pairs, e.g. 5:2,6:1; source measures exclude generated lead-in bars",
+    )
     p_convert.add_argument("-o", "--out", help="output folder (default: songs/Artist - Title)")
     p_convert.add_argument(
         "--offset-ms", type=int, default=0,
@@ -971,6 +1116,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=chart_writer.DEFAULT_LEAD_IN_BARS,
         help="empty measures before the score starts "
         f"(default {chart_writer.DEFAULT_LEAD_IN_BARS}; 0 disables)",
+    )
+    p_convert.add_argument(
+        "--no-star-power", action="store_true",
+        help="do not generate automatic Star Power phrases",
     )
     p_convert.add_argument(
         "-i", "--interactive", action="store_true",

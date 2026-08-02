@@ -119,6 +119,48 @@ class TestBlend:
         _, choices = blend_tracks({0: a, 1: b}, [1, 0], sections=[])
         assert choices[0]["track"] == 1
 
+    def test_harmony_follows_upper_voice_without_bar_alternation(self):
+        low = [
+            _note(0, pitch=54, fret=5), _note(0, pitch=66, string=2, fret=5),
+            _note(3840, pitch=54, fret=5), _note(3840, pitch=66, string=2, fret=5),
+        ]
+        high = [
+            _note(3840, pitch=57, fret=5), _note(3840, pitch=69, string=2, fret=5),
+            _note(4800, pitch=57, fret=5), _note(4800, pitch=69, string=2, fret=5),
+        ]
+        blended, choices = blend_tracks(
+            {0: low, 1: high}, [0, 1], [{"tick": 0, "bar": 0, "name": "Riff"}], [0, 3840],
+        )
+
+        assert [choice["track"] for choice in choices] == [0, 1]
+        assert not any(note.get("harmony_voice") for note in blended if note["tick"] == 0)
+        assert all(note.get("harmony_voice") for note in blended if note["tick"] == 3840)
+
+    def test_dense_simultaneous_harmony_keeps_both_parts(self):
+        # A rapid chord wall is not two alternate parts: retaining both lets
+        # the mapper represent its changing harmony as a playable triad.
+        low = [
+            _note(tick, pitch=54, fret=5) for tick in range(0, 8 * 240, 240)
+        ]
+        high = [
+            _note(tick, pitch=57, fret=5) for tick in range(0, 8 * 240, 240)
+        ]
+        blended, _ = blend_tracks(
+            {0: low, 1: high}, [0, 1], [{"tick": 0, "bar": 0, "name": "Wall"}], [0, 3840],
+        )
+        assert sorted(note["pitch"] for note in blended if note["tick"] == 0) == [54, 57]
+
+    def test_bar_track_override_wins_over_normal_blending(self):
+        rhythm = [_note(0, pitch=40), _note(3840, pitch=40)]
+        lead = [_note(0, pitch=70, tap=True), _note(3840, pitch=70)]
+        blended, choices = blend_tracks(
+            {0: rhythm, 1: lead}, [1, 0], [{"tick": 0, "bar": 0, "name": "Riff"}], [0, 3840],
+            {3840: 0},
+        )
+
+        assert [choice["track"] for choice in choices] == [1, 0]
+        assert [note["pitch"] for note in blended if note["tick"] == 3840] == [40]
+
 
 class TestMapper:
     def test_tick_conversion_and_contour_lanes(self):
@@ -127,6 +169,63 @@ class TestMapper:
         notes = map_notes([_note(0, pitch=62, fret=5), _note(960, pitch=63, fret=6)])
         assert notes[0].tick == 0 and notes[0].lanes == [0]   # first note anchors to 0
         assert notes[1].tick == CHART_RESOLUTION and notes[1].lanes == [1]  # next pitch up
+
+    def test_phrase_start_leaves_room_for_initial_descent(self):
+        mapped = map_notes([
+            _note(0, pitch=42, fret=4),
+            _note(960, pitch=42, fret=4),
+            _note(1920, pitch=40, fret=2),
+        ])
+        assert [note.lanes for note in mapped] == [[1], [1], [0]]
+
+    def test_section_planning_sees_a_descent_beyond_the_local_window(self):
+        # Eight repeated opening notes used to anchor this whole section at
+        # green; the eventual lower note then wrapped immediately to orange.
+        ir = [_note(index * 960, pitch=42, fret=4) for index in range(10)]
+        ir.append(_note(10 * 960, pitch=40, fret=2))
+        mapped = map_notes(ir, section_ticks=[0])
+        assert [note.lanes[0] for note in mapped[-3:]] == [1, 1, 0]
+
+    def test_descending_figure_at_bar_start_reanchors_without_a_rest(self):
+        mapped = map_notes([
+            _note(0, pitch=50, fret=5), _note(960, pitch=50, fret=5),
+            _note(1920, pitch=50, fret=5), _note(2880, pitch=50, fret=5),
+            _note(3840, pitch=42, fret=4), _note(4800, pitch=42, fret=4),
+            _note(5760, pitch=40, fret=2),
+        ], bar_ticks=[0, 3840])
+        assert [note.lanes for note in mapped[-3:]] == [[1], [1], [0]]
+
+    def test_upper_harmony_widens_dyad_to_red_blue(self):
+        mapped = map_notes([
+            _note(0, pitch=54, string=1, fret=5),
+            _note(0, pitch=66, string=2, fret=5),
+            _note(960, pitch=57, string=1, fret=5, harmony_voice=True),
+            _note(960, pitch=69, string=2, fret=5, harmony_voice=True),
+        ])
+        assert [note.lanes for note in mapped] == [[0, 1], [1, 3]]
+
+    def test_dense_harmony_triad_uses_a_playable_gap(self):
+        # Dense two-guitar walls should not default to a lazy three-adjacent
+        # button block when a G/R/B voicing is legal.
+        mapped = map_notes([
+            _note(0, pitch=54, string=1, fret=5),
+            _note(0, pitch=57, string=2, fret=5, harmony_voice=True),
+            _note(0, pitch=66, string=3, fret=5),
+        ])
+        assert mapped[0].lanes == [0, 1, 3]
+
+    def test_dense_chord_progression_uses_wider_dyads_without_harmony(self):
+        # Two distinct chord changes inside one bar make this an active
+        # progression, so the third dyad gets a playable gap even without
+        # a twin-guitar harmony marker.
+        notes = []
+        for tick, root in enumerate((40, 43, 46)):
+            notes += [
+                _note(tick * 960, pitch=root, string=1, fret=5),
+                _note(tick * 960, pitch=root + 7, string=2, fret=5),
+            ]
+        mapped = map_notes(notes)
+        assert mapped[2].lanes == [2, 4]
 
     def test_open_chug_on_lowest_string(self):
         # String 1 tuned to pitch 36 (fret 0), string 2 higher.
@@ -164,6 +263,21 @@ class TestMapper:
         lanes = notes[0].lanes
         assert len(lanes) == 3  # capped, no 4-note chord
         assert all(0 <= lane <= 4 for lane in lanes)
+
+    def test_chord_cap_handles_a_double_of_the_dropped_pitch(self):
+        # Dense blended guitars can contain four pitches plus an octave/string
+        # double of the highest one.  The cap must remap that double rather
+        # than looking up a lane for the dropped representative.
+        chord = [
+            _note(0, pitch=40, string=1, fret=5),
+            _note(0, pitch=47, string=2, fret=5),
+            _note(0, pitch=52, string=3, fret=5),
+            _note(0, pitch=59, string=4, fret=5),
+            _note(0, pitch=59, string=5, fret=5),
+        ]
+        mapped = map_notes(chord)
+        assert len(mapped[0].lanes) == 3
+        assert len(set(mapped[0].lanes)) == 3
 
     def test_power_chord_two_distinct_lanes(self):
         # No interval-spread voicing anymore: a power chord is simply two
@@ -266,6 +380,56 @@ class TestMapper:
         mapped = map_notes(notes)
         assert len(mapped) == 3
         assert mapped[0].lanes == mapped[1].lanes == mapped[2].lanes
+
+    def test_repeated_fretted_riff_shape_is_stable_across_a_section(self):
+        # The same chord can return after contrasting material. It should
+        # keep the lane shape established by its first occurrence, rather
+        # than being rotated to make room for a later register change.
+        notes = [
+            _note(0, pitch=40, string=1, fret=5),
+            _note(0, pitch=47, string=2, fret=7),
+            _note(0, pitch=52, string=3, fret=5),
+            _note(960, pitch=45, string=1, fret=5),
+            _note(960, pitch=52, string=2, fret=7),
+            _note(960, pitch=57, string=3, fret=5),
+            _note(6000, pitch=40, string=1, fret=5),
+            _note(6000, pitch=47, string=2, fret=7),
+            _note(6000, pitch=52, string=3, fret=5),
+        ]
+        mapped = map_notes(notes, section_ticks=[0], bar_ticks=[0, 4 * 960, 6 * 960])
+        assert mapped[0].lanes == mapped[2].lanes
+
+    def test_identical_measure_reuses_lanes_across_sections(self):
+        # The first complete bar returns after contrasting material and a
+        # section marker. Exact source-measure memory preserves its lanes.
+        riff = [40, 43, 45, 47]
+        notes = [_note(index * 960, pitch=pitch, fret=5) for index, pitch in enumerate(riff)]
+        notes += [_note(4 * 960, pitch=60, fret=5), _note(5 * 960, pitch=62, fret=5)]
+        notes += [_note((index + 6) * 960, pitch=pitch, fret=5) for index, pitch in enumerate(riff)]
+        mapped = map_notes(
+            notes,
+            section_ticks=[0, 6 * 960],
+            bar_ticks=[0, 4 * 960, 6 * 960, 10 * 960],
+        )
+        assert [note.lanes for note in mapped[:4]] == [note.lanes for note in mapped[6:10]]
+
+    def test_repeated_phrase_prefix_stays_stable_before_a_turnaround(self):
+        # Two measures share four chugs, then the second turns down to a
+        # different fret. The shared prefix is still the same riff.
+        notes = [_note(index * 960, pitch=42, fret=4) for index in range(4)]
+        notes += [_note(4 * 960, pitch=49, string=2, fret=4)]
+        notes += [_note((index + 6) * 960, pitch=42, fret=4) for index in range(4)]
+        notes += [_note(10 * 960, pitch=40, fret=2)]
+        mapped = map_notes(
+            notes,
+            section_ticks=[0],
+            bar_ticks=[0, 4 * 960, 6 * 960],
+        )
+        assert [note.lanes for note in mapped[:4]] == [note.lanes for note in mapped[5:9]]
+        # The lower turnaround reserves one lane of headroom: the shared
+        # chugs start red and descend to green instead of green to orange.
+        assert mapped[0].lanes == [1]
+        assert mapped[9].lanes == [0]
 
     def test_cursor_resync_does_not_drift_over_long_progression(self):
         # Stress test for the resync mechanism in _assign_group_lanes
