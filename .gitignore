@@ -28,3 +28,7 @@ output/
 Senses Fail - Can't Be Saved (Neversoft)/
 Senses Fail - Can't Be Saved (oBLINKxONCEo)/
 Senses Fail - Sick or Sane (Fifty for a Twenty) (Angevil)/
+
+# Pytest basetemp and legacy local test artifact dirs
+.test-*
+.pytest-tmp/
