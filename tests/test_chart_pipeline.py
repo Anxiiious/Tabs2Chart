@@ -517,18 +517,26 @@ class TestMapper:
         assert len(mapped[0].lanes) == 3
         assert OPEN_NOTE not in mapped[0].lanes
 
-    def test_all_open_rake_collapses_to_one_open_note(self):
-        # Every note open, spanning three strings including the lowest-tuned
-        # one: one rhythmic chug, charted as a single OPEN note however many
-        # strings the player actually rakes.
+    def test_lone_open_note_becomes_an_open_note(self):
+        # A single open note on the lowest-tuned string is the one case that
+        # becomes OPEN.
+        mapped = map_notes([_note(0, pitch=36, string=1, fret=0)])
+        assert mapped[0].lanes == [OPEN_NOTE]
+
+    def test_open_rake_is_a_chord_not_an_open_note(self):
+        # Three open strings raked together are a chord, not an open note --
+        # the professional reference charts this shape on two lanes, never
+        # as OPEN.  In drop tuning the open strings form root/fifth/octave,
+        # so the power-chord fold reduces the rake to two lanes.
         chord = [
             _note(0, pitch=36, string=1, fret=0, chord_id=0),
-            _note(0, pitch=46, string=2, fret=0, chord_id=0),
-            _note(0, pitch=56, string=3, fret=0, chord_id=0),
+            _note(0, pitch=43, string=2, fret=0, chord_id=0),
+            _note(0, pitch=48, string=3, fret=0, chord_id=0),
         ]
         mapped = map_notes(chord)
         assert len(mapped) == 1
-        assert mapped[0].lanes == [OPEN_NOTE]
+        assert OPEN_NOTE not in mapped[0].lanes
+        assert len(mapped[0].lanes) == 2
 
     def test_power_chord_stack_folds_to_two_lanes(self):
         # Root / fifth / octave barred across three strings is one finger and

@@ -48,18 +48,30 @@ Distinct-lane guarantee: every note in a same-tick group always lands on
 its own lane (or, for open chugs, the OPEN_NOTE sentinel) — chords never
 lose notes to collisions, regardless of chord width.
 
-REDUCTION BEFORE PLACEMENT: two shapes are folded down before any of the
-above runs, because they are one musical event that happens to touch
-several strings, and charting a button per string misrepresents them:
-- an all-open low rake -> a single OPEN note (`_is_open_chug`)
-- a power chord, root/fifth/octave -> its two distinct voices
-  (`_is_power_chord`)
-Both were measured against a hand-charted reference for this repo's test
-song: the power-chord test fired on 175 of 472 onsets with no false
-positives, and removed 210 notes that the reference chart does not play.
-Note that these are *reductions of the source group*, not scoring
-preferences — once folded, the surviving voices go through the ordinary
-anchor/shape path unchanged.
+REDUCTION BEFORE PLACEMENT: a power chord (root/fifth/octave, the
+one-finger barre) is folded to its two distinct voices before any of the
+above runs — `_is_power_chord`. It is one musical event that happens to
+touch several strings, and charting a button per string turns a one-finger
+chug into a three-button chord. Measured on two per-onset aligned
+references: 175 of 472 onsets on a hand-charted reference with no false
+positives (210 notes removed), and 46 of 46 agreement with a professional
+reference (Kublai Khan TX - Boomslang, charted by Chezy).
+
+This is a *reduction of the source group*, not a scoring preference — once
+folded, the surviving voices go through the ordinary anchor/shape path
+unchanged. It also subsumes the multi-string open rake, which in drop
+tuning is a root/fifth/octave stack; `_is_open_chug` deliberately keeps
+only the literal single open note, and documents the reference data for
+that split.
+
+KNOWN LIMITATION — state cascade: the persistent contour cursor, riff-shape
+cache and phrase replay make lane assignment highly order-dependent, so a
+local rule change does not stay local. Restricting `_is_open_chug` to
+single notes directly targets 35 onsets of the Extortionist reference but
+perturbs 428 (12.2x amplification, 393 of them collateral). Any A/B
+measurement of a scoring or reduction change is contaminated by this;
+treat aggregate match rates as weak evidence and prefer per-onset
+comparison against an aligned reference.
 
 Still retained: ties merge into sustains, open-string chug rule
 (bypasses the cursor entirely), hammer_on/pull_off -> forced flip,
@@ -183,22 +195,36 @@ def _merge_ties(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _is_open_chug(group: list[dict[str, Any]], chug_string: int | None) -> bool:
-    """True when every note struck at this tick is an open string and the
-    group includes the lowest-tuned string — the rhythmic low chug that
-    real charts write as a single open note, however many strings the
-    player actually rakes.
+    """True only when a *single* open note is struck on the lowest-tuned
+    string. A multi-string open rake is not an open note.
 
-    Deliberately independent of the power-chord test below: in drop tuning
-    the open 6/5/4 rake *is* a power chord, but in standard tuning the same
-    three open strings are a fourth stack, and both are still one open-note
-    chug. Tuning decides the intervals; it should not decide whether an
-    all-open rake reads as one hit.
+    This is narrower than it looks like it should be, and the narrowness is
+    the finding. Measured against a professionally charted reference
+    (Kublai Khan TX - Boomslang, charted by Chezy) on a per-onset aligned
+    comparison, that charter's usage splits cleanly by how many strings the
+    tab strikes:
+
+        1 string open   -> OPEN            25 / 25
+        2 strings open  -> two lanes       72 / 74
+        3 strings open  -> two lanes       16 / 16
+
+    So OPEN means "one open string", not "an open-sounding hit". A rake
+    across several open strings is a chord and is charted as one: in drop
+    tuning those strings *are* a root/fifth/octave stack, so it reaches
+    `_is_power_chord` below and folds to two lanes on its own. The two
+    rules compose - this one keeps the literal single open note, that one
+    handles every wider open shape - which is why this must stay narrow
+    rather than swallowing the multi-string case first.
+
+    Note that one amateur reference (Extortionist - Circle Of Serpents)
+    does the opposite, opening 33 of 35 three-string rakes. The two
+    conventions genuinely differ; this follows the professional one.
     """
     if chug_string is None:
         return False
-    if not any(note.get("string") == chug_string for note in group):
+    if len(group) != 1:
         return False
-    return all(note.get("fret") == 0 for note in group)
+    return group[0].get("string") == chug_string and group[0].get("fret") == 0
 
 
 def _is_power_chord(pitches: list[int]) -> bool:
@@ -467,14 +493,13 @@ def _assign_group_lanes(
     lanes: dict[int, int] = {}
     taken: set[int] = set()
 
-    # An all-open low rake is one chug regardless of how many strings it
-    # spans. The test is "every note in the group is open", not "only one
-    # note was struck": a fretted note anywhere in the group means an open
-    # string is ringing *under* a voicing, which is a real chord and still
-    # goes through the fretted-note logic below.
+    # A lone open note on the lowest string is the one case that becomes an
+    # OPEN note. Anything wider - an open rake, or an open string ringing
+    # under a fretted voicing - is a chord, and falls through to the
+    # fretted-note logic below (where the power-chord fold catches the
+    # drop-tuning open rake). See `_is_open_chug` for the reference data.
     if _is_open_chug(group, chug_string):
-        for note in group:
-            lanes[id(note)] = OPEN_NOTE
+        lanes[id(group[0])] = OPEN_NOTE
         return lanes
 
     fretted = list(group)
