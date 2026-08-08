@@ -357,7 +357,18 @@ def _rank_chord_shape(
     # Continues the established staircase motion. anchor_preferred_lane is
     # already cursor % 5 (wraparound-correct), so matching it *is* the
     # wrap-aware continuation — this is where chord wraparound comes from.
-    if direction != 0 and anchor_lane == anchor_preferred_lane:
+    #
+    # Fires regardless of `direction`. It used to require direction != 0,
+    # which silently excluded exactly the phrase-start case: with no trend
+    # yet, `anchor`, `harmonic_change` and `unpinned` all sit out, every
+    # candidate ranks 0.0, and the winner falls to the arbitrary sort key
+    # below. That made the opening chord of a phrase — which the riff cache
+    # then replays across the whole section — a coin flip, and left it
+    # sensitive to unrelated upstream changes. At a phrase start
+    # `anchor_preferred_lane` is the lane `_plan_phrase_start_lanes`
+    # deliberately picked, so it is the *most* trustworthy signal available
+    # at that moment, not the least.
+    if anchor_lane == anchor_preferred_lane:
         breakdown["anchor"] = _WEIGHT_ANCHOR
 
     # Registers as harmonically different from the previous shape, but
