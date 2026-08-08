@@ -6,6 +6,7 @@ from shred2chart.chart_writer import DEFAULT_LEAD_IN_BARS, add_lead_in, build_ch
 from shred2chart.mapper import (
     CHART_RESOLUTION,
     IR_TICKS_PER_QUARTER,
+    OPEN_NOTE,
     ChartNote,
     map_notes,
 )
@@ -251,12 +252,15 @@ class TestMapper:
     def test_chord_caps_at_three_distinct_lanes(self):
         # Game plan rule 3: chords cap at 3 distinct notes for playability.
         # A 4-note voicing collapses to 3 lanes rather than emitting a
-        # 4-note chord.
+        # 4-note chord.  The pitches spell a major triad plus a sixth so the
+        # voicing is a genuine four-note harmony — a root/fifth/octave stack
+        # would be folded to two lanes by the power-chord rule long before
+        # the cap ever saw it, and would not exercise this path.
         chord = [
             _note(0, pitch=40, string=1, fret=5, chord_id=0),
-            _note(0, pitch=47, string=2, fret=5, chord_id=0),
-            _note(0, pitch=52, string=3, fret=5, chord_id=0),
-            _note(0, pitch=59, string=4, fret=5, chord_id=0),
+            _note(0, pitch=44, string=2, fret=5, chord_id=0),
+            _note(0, pitch=47, string=3, fret=5, chord_id=0),
+            _note(0, pitch=49, string=4, fret=5, chord_id=0),
         ]
         notes = map_notes(chord)
         assert len(notes) == 1
@@ -270,10 +274,10 @@ class TestMapper:
         # than looking up a lane for the dropped representative.
         chord = [
             _note(0, pitch=40, string=1, fret=5),
-            _note(0, pitch=47, string=2, fret=5),
-            _note(0, pitch=52, string=3, fret=5),
-            _note(0, pitch=59, string=4, fret=5),
-            _note(0, pitch=59, string=5, fret=5),
+            _note(0, pitch=44, string=2, fret=5),
+            _note(0, pitch=47, string=3, fret=5),
+            _note(0, pitch=49, string=4, fret=5),
+            _note(0, pitch=49, string=5, fret=5),
         ]
         mapped = map_notes(chord)
         assert len(mapped[0].lanes) == 3
@@ -499,13 +503,57 @@ class TestMapper:
         assert back_mean <= front_mean + 1.0  # no systematic growth over the run
 
     def test_open_chug_chord_keeps_all_notes(self):
-        # Chord containing a fret-0 note on the chug string plus two
-        # fretted notes: all three should survive as distinct lanes
-        # (one OPEN + two fretted).
+        # An open string ringing *under* fretted notes is a real chord
+        # voicing, not a chug: the group must stay on three distinct fretted
+        # lanes rather than collapsing to a single OPEN note.  Only a group
+        # where every note is open is a chug — see the test below.
+        chord = [
+            _note(0, pitch=36, string=1, fret=0, chord_id=0),
+            _note(0, pitch=48, string=2, fret=2, chord_id=0),
+            _note(0, pitch=58, string=3, fret=2, chord_id=0),
+        ]
+        mapped = map_notes(chord)
+        assert len(mapped) == 1
+        assert len(mapped[0].lanes) == 3
+        assert OPEN_NOTE not in mapped[0].lanes
+
+    def test_all_open_rake_collapses_to_one_open_note(self):
+        # Every note open, spanning three strings including the lowest-tuned
+        # one: one rhythmic chug, charted as a single OPEN note however many
+        # strings the player actually rakes.
         chord = [
             _note(0, pitch=36, string=1, fret=0, chord_id=0),
             _note(0, pitch=46, string=2, fret=0, chord_id=0),
             _note(0, pitch=56, string=3, fret=0, chord_id=0),
+        ]
+        mapped = map_notes(chord)
+        assert len(mapped) == 1
+        assert mapped[0].lanes == [OPEN_NOTE]
+
+    def test_power_chord_stack_folds_to_two_lanes(self):
+        # Root / fifth / octave barred across three strings is one finger and
+        # one musical event.  It must occupy two lanes, not three — charting
+        # a button per string inflates the note count without adding anything
+        # to play.
+        chord = [
+            _note(0, pitch=40, string=1, fret=5, chord_id=0),
+            _note(0, pitch=47, string=2, fret=5, chord_id=0),
+            _note(0, pitch=52, string=3, fret=5, chord_id=0),
+        ]
+        mapped = map_notes(chord)
+        assert len(mapped) == 1
+        assert len(mapped[0].lanes) == 2
+        assert len(set(mapped[0].lanes)) == 2
+
+    def test_non_power_three_note_chord_keeps_three_lanes(self):
+        # The drop-tuning shape one fret up from the barre (root, tritone,
+        # fourth) is a genuine three-note harmony and must keep all three
+        # lanes.  This is the discriminator the fold turns on: same three
+        # strings, different intervals, different answer.
+        chord = [
+            _note(0, pitch=40, string=1, fret=5, chord_id=0),
+            _note(0, pitch=46, string=2, fret=4, chord_id=0),
+            _note(0, pitch=51, string=3, fret=4, chord_id=0),
         ]
         mapped = map_notes(chord)
         assert len(mapped) == 1

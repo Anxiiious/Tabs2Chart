@@ -48,6 +48,19 @@ Distinct-lane guarantee: every note in a same-tick group always lands on
 its own lane (or, for open chugs, the OPEN_NOTE sentinel) — chords never
 lose notes to collisions, regardless of chord width.
 
+REDUCTION BEFORE PLACEMENT: two shapes are folded down before any of the
+above runs, because they are one musical event that happens to touch
+several strings, and charting a button per string misrepresents them:
+- an all-open low rake -> a single OPEN note (`_is_open_chug`)
+- a power chord, root/fifth/octave -> its two distinct voices
+  (`_is_power_chord`)
+Both were measured against a hand-charted reference for this repo's test
+song: the power-chord test fired on 175 of 472 onsets with no false
+positives, and removed 210 notes that the reference chart does not play.
+Note that these are *reductions of the source group*, not scoring
+preferences — once folded, the surviving voices go through the ordinary
+anchor/shape path unchanged.
+
 Still retained: ties merge into sustains, open-string chug rule
 (bypasses the cursor entirely), hammer_on/pull_off -> forced flip,
 tap -> tap flag, sustain threshold + gap trim.
@@ -70,6 +83,13 @@ OPEN_NOTE = 7
 _MAX_CHORD_PITCHES = 3  # game plan rule 3: chords cap at 3 distinct notes for playability
 FORCED_FLAG = 5
 TAP_FLAG = 6
+
+# Pitch classes, relative to the root, that a power chord is allowed to
+# contain: the root itself (0, which also covers octave doublings) and the
+# perfect fifth (7). A group whose classes fall entirely inside this set is
+# one barred shape under one finger, not a three-note harmony — see
+# `_is_power_chord`.
+_POWER_CHORD_CLASSES = frozenset({0, 7})
 
 _MAX_LANE = 4  # lanes are 0-4; OPEN_NOTE(7) lives outside this range
 _REST_RESET_TICKS = IR_TICKS_PER_QUARTER * 4  # 1 bar
@@ -160,6 +180,46 @@ def _merge_ties(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         last_by_string[key] = copy
     merged.sort(key=lambda n: n["tick"])
     return merged
+
+
+def _is_open_chug(group: list[dict[str, Any]], chug_string: int | None) -> bool:
+    """True when every note struck at this tick is an open string and the
+    group includes the lowest-tuned string — the rhythmic low chug that
+    real charts write as a single open note, however many strings the
+    player actually rakes.
+
+    Deliberately independent of the power-chord test below: in drop tuning
+    the open 6/5/4 rake *is* a power chord, but in standard tuning the same
+    three open strings are a fourth stack, and both are still one open-note
+    chug. Tuning decides the intervals; it should not decide whether an
+    all-open rake reads as one hit.
+    """
+    if chug_string is None:
+        return False
+    if not any(note.get("string") == chug_string for note in group):
+        return False
+    return all(note.get("fret") == 0 for note in group)
+
+
+def _is_power_chord(pitches: list[int]) -> bool:
+    """True when three or more distinct pitches collapse onto just the root
+    and its fifth — root/fifth/octave and its extensions.
+
+    This is the one-finger barre across adjacent strings (in drop tuning,
+    a single fret across strings 6/5/4). Musically and physically it is one
+    event, so it belongs on two lanes, not three: charting each string
+    separately turns a one-finger chug into a three-button chord and
+    inflates the note count without adding anything to play.
+
+    Requires three or more distinct pitches on purpose. A bare root+fifth
+    dyad already occupies exactly two lanes, so there is nothing to
+    collapse and this must not fire on it.
+    """
+    distinct = sorted(set(pitches))
+    if len(distinct) < 3:
+        return False
+    root = distinct[0]
+    return all((pitch - root) % 12 in _POWER_CHORD_CLASSES for pitch in distinct)
 
 
 def _lowest_tuning_string(notes: list[dict[str, Any]]) -> int | None:
@@ -396,17 +456,14 @@ def _assign_group_lanes(
     lanes: dict[int, int] = {}
     taken: set[int] = set()
 
-    # An open chug is only unambiguous when it's the sole note struck at
-    # this tick - if it's one voice within a same-tick group, it's part of
-    # a chord voicing (e.g. an open string ringing under a fretted note),
-    # not an isolated rhythmic chug, and must go through the normal
-    # fretted-note lane logic like its groupmates.
-    if (
-        len(group) == 1
-        and group[0]["fret"] == 0
-        and group[0]["string"] == chug_string
-    ):
-        lanes[id(group[0])] = OPEN_NOTE
+    # An all-open low rake is one chug regardless of how many strings it
+    # spans. The test is "every note in the group is open", not "only one
+    # note was struck": a fretted note anywhere in the group means an open
+    # string is ringing *under* a voicing, which is a real chord and still
+    # goes through the fretted-note logic below.
+    if _is_open_chug(group, chug_string):
+        for note in group:
+            lanes[id(note)] = OPEN_NOTE
         return lanes
 
     fretted = list(group)
@@ -427,6 +484,23 @@ def _assign_group_lanes(
 
     kept = list(seen_pitches.values())
     kept.sort(key=lambda n: n["pitch"] or 0)
+
+    # Fold a power chord down to its distinct voices before any shape is
+    # chosen. The octave (and any further doubling) shares its root's lane
+    # via the same `extras` mechanism that already handles unison doubles
+    # on different strings, so the note survives into the chart and simply
+    # stops claiming a button of its own.
+    if _is_power_chord([note["pitch"] or 0 for note in kept]):
+        root_pitch = kept[0]["pitch"] or 0
+        voices: dict[int, dict[str, Any]] = {}
+        for note in kept:
+            pitch_class = ((note["pitch"] or 0) - root_pitch) % 12
+            if pitch_class in voices:
+                extras.append((note, voices[pitch_class]))
+            else:
+                voices[pitch_class] = note
+        kept = sorted(voices.values(), key=lambda n: n["pitch"] or 0)
+
     if len(kept) > _MAX_CHORD_PITCHES:
         dropped = kept[_MAX_CHORD_PITCHES:]
         kept = kept[:_MAX_CHORD_PITCHES]
